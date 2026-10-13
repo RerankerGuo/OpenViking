@@ -632,7 +632,7 @@ def _format_openviking_health(status: Any) -> dict[str, Any]:
 
 def _infer_health_state(status: Any) -> str:
     if isinstance(status, dict):
-        for key in ("healthy", "ok"):
+        for key in ("is_healthy", "healthy", "ok"):
             value = status.get(key)
             if isinstance(value, bool):
                 return "healthy" if value else "unhealthy"

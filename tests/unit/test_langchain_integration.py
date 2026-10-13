@@ -392,6 +392,33 @@ def test_openviking_health_tool_returns_safe_summary():
     assert "postgres://" not in json.dumps(payload)
 
 
+@pytest.mark.parametrize("flag", [True, False])
+def test_openviking_health_tool_honors_is_healthy_flag(flag):
+    """Regression coverage for issue #5876: the SDK's ``is_healthy`` field must
+    drive the tool's ``state`` / ``healthy`` outputs instead of being silently
+    dropped, matching what ``SyncHTTPClient.is_healthy()`` already returns.
+
+    ``SyncHTTPClient.get_status()`` unwraps the API envelope (``{"status",
+    "result": {...}}``) and returns the inner body, so ``is_healthy`` lives at
+    the top level of the dict the tool sees.
+    """
+
+    class StatusClient(InMemoryOpenVikingClient):
+        def get_status(self) -> dict[str, Any]:
+            return {
+                "is_healthy": flag,
+                "errors": [],
+                "components": {"storage": {"status": "ok"}},
+            }
+
+    tools = {tool.name: tool for tool in create_openviking_tools(client=StatusClient())}
+    payload = json.loads(tools["viking_health"].invoke({}))
+
+    expected_state = "healthy" if flag else "unhealthy"
+    assert payload["state"] == expected_state
+    assert payload["healthy"] is flag
+
+
 def test_openviking_read_directory_uri_returns_recoverable_tool_result_for_all_modes():
     class DirectoryReadClient(InMemoryOpenVikingClient):
         def read(self, uri: str, offset: int = 0, limit: int = -1) -> str:
