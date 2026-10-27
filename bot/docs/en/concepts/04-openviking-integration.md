@@ -7,6 +7,7 @@ OpenViking is VikingBot's long-term context layer. VikingBot handles real-time c
 ```text
 OpenViking → VikingBot
   Resource: provide knowledge and file context for tasks
+  Skill: provide searchable task instructions and supporting resources
   Memory: provide the current user/Peer's Profile, preferences, entities, and events
   Experience: provide methods the Agent used to complete similar tasks in the past
   Session: provide compressed history and conversation archives
@@ -144,6 +145,7 @@ When a channel enables `ov_tools_enable`, the Agent can use:
 |------|------------|
 | `openviking_list` | Browse a Viking URI directory |
 | `openviking_search` | Semantically search Resources, Memories, and Skills |
+| `openviking_rule_search` (Beta) | Retrieve compiled Rules applicable to a concrete task context |
 | `openviking_grep` | Run regular-expression searches over OpenViking content |
 | `openviking_glob` | Search URI paths with glob patterns |
 | `openviking_multi_read` | Read the full content of multiple URIs concurrently |
@@ -152,7 +154,18 @@ When a channel enables `ov_tools_enable`, the Agent can use:
 
 OpenViking tools obtain the current actor peer and request-scoped connection through ToolContext. Retrieval covers Resources, Peer Memories, and Skill paths accessible to the current identity.
 
-`openviking_add_resource` starts asynchronous resource processing and is not registered in `readonly` mode. `openviking_memory_commit` is intended for cases where the user explicitly asks the Agent to remember something.
+`openviking_rule_search` is a read-only Rule search tool and is registered in `readonly`
+mode. `openviking_add_resource` starts asynchronous resource processing and is not
+registered in `readonly` mode. `openviking_memory_commit` is intended for cases where
+the user explicitly asks the Agent to remember something.
+
+## Using Remote Skills
+
+Upload a Skill package with `ov add-skill ./skills/<name>/` to the OpenViking service used by the Bot, and ensure the Bot's current identity can read it. With `ov_tools_enable` enabled on the channel, an available connection, and `openviking_multi_read` not disabled, the Bot retrieves remote Skill summaries for the user query.
+
+The model reads the selected `SKILL.md` URI with `openviking_multi_read`, which validates and activates the Skill. You can also give the Bot a canonical `SKILL.md` URI returned by the service. Text references stay remote; scripts or tools that need local files trigger package download and path rewriting. Each user message activates Skills independently, and execution copies are cleaned at turn completion.
+
+No additional Remote Skill switch or manual download is required. See [Skills](./06-skills.md) for local/remote examples, frontmatter fields, tool policies, and `bot.remote_skills` configuration.
 
 ## Local Sessions and OpenViking Sessions
 
@@ -287,6 +300,7 @@ Bot Chat and OpenViking APIs can therefore share one Gateway address, while Open
 
 - [VikingBot Architecture](./01-architecture.md)
 - [Agent Capabilities](./02-agent-capabilities.md)
+- [Skills](./06-skills.md)
 - [Channels, Gateway, and Operations](./03-channels-and-gateway.md)
 - [OpenViking Architecture](../../../../docs/en/concepts/01-architecture.md)
 - [OpenViking Context Types](../../../../docs/en/concepts/02-context-types.md)

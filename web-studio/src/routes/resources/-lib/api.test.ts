@@ -27,6 +27,16 @@ beforeEach(() => {
 })
 
 describe('fetchDirectorySidecarContent', () => {
+  it.each(['abstract', 'overview'] as const)(
+    'does not read a %s sidecar for the virtual root',
+    async (level) => {
+      await expect(
+        fetchDirectorySidecarContent('viking://', level),
+      ).resolves.toBe('')
+      expect(getContentReadMock).not.toHaveBeenCalled()
+    },
+  )
+
   it('reads raw L0/L1 sidecars instead of the body-only semantic accessors', async () => {
     getContentReadMock.mockResolvedValue({
       data: {
@@ -53,7 +63,7 @@ describe('fetchDirectorySidecarContent', () => {
 
 describe('fetchFsList', () => {
   it('requests newest entries before the server applies node_limit', async () => {
-    await fetchFsList('viking://session', { nodeLimit: 200 })
+    await fetchFsList('viking://~/sessions', { nodeLimit: 200 })
 
     expect(getFsLsMock).toHaveBeenCalledWith({
       query: expect.objectContaining({

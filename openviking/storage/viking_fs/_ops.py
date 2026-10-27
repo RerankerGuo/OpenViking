@@ -3,10 +3,11 @@
 """Core filesystem operations mixin for VikingFS."""
 
 import asyncio
+import math
 import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Union
 
 from openviking.core.context import ContextLevel
 from openviking.core.namespace import (
@@ -27,8 +28,8 @@ from openviking.storage.abstract_overview import (
     rewrite_abstract_overview_for_transfer,
 )
 from openviking.storage.acl import AclAction, is_acl_uri
-from openviking.storage.expr import PathScope
-from openviking.storage.internal_names import STORAGE_INTERNAL_ENTRY_NAMES
+from openviking.storage.expr import And, PathScope, RawDSL
+from openviking.storage.internal_names import is_storage_internal_name
 from openviking.storage.vector_ids import is_vector_record_id, vector_record_id
 from openviking.storage.viking_fs._base import (
     _ABSTRACT_WORKER_COUNT,
@@ -39,10 +40,10 @@ from openviking.storage.viking_fs._base import (
 )
 from openviking.utils.time_utils import format_iso8601, parse_iso_datetime
 from openviking_cli.exceptions import (
-    FailedPreconditionError,
     InvalidArgumentError,
     NotFoundError,
     PermissionDeniedError,
+    ResourceExhaustedError,
 )
 from openviking_cli.utils.uri import VikingURI
 
@@ -57,6 +58,78 @@ def _glob_match_uri(entry_uri: str, is_dir: Optional[bool]) -> str:
     if not is_dir or entry_uri.endswith("/"):
         return entry_uri
     return f"{entry_uri}/"
+
+
+_REMOTE_GLOB_OUTPUT_FIELDS = ["uri", "level", "name"]
+_REMOTE_GLOB_ENTRY_FIELDS = ["size", "mode", "modTime"]
+_REMOTE_GLOB_DEFAULT_LIMIT = 100000
+_REMOTE_GLOB_MAX_LIMIT = 100000
+_REMOTE_GLOB_POST_PROCESS_INPUT_LIMIT = 1000000
+_REMOTE_GLOB_LOCAL_STAT_FIELDS = {
+    "size",
+    "mode",
+    "modTime",
+    "mtime",
+    "is_dir",
+}
+_REMOTE_GLOB_LOCAL_COMPUTED_FIELDS = {
+    "id",
+    "count",
+    "isLocked",
+    "locked",
+}
+_GLOB_SPECIAL_CHARS = set("*?[{")
+
+
+def _normalize_uri_for_glob(uri: str) -> str:
+    return "viking://" if uri == "viking://" else uri.rstrip("/")
+
+
+def _normalize_glob_path(pattern: str) -> str:
+    return "/".join(segment for segment in pattern.split("/") if segment and segment != ".")
+
+
+def _uri_to_remote_path_pattern(uri: str, pattern: str) -> str:
+    base_path = "/" + _normalize_uri_for_glob(uri)[len("viking://") :].strip("/")
+    if base_path == "/":
+        base_path = ""
+    normalized_pattern = _normalize_glob_path(pattern)
+    if not normalized_pattern:
+        return base_path or "/"
+    return f"{base_path}/{normalized_pattern}" if base_path else f"/{normalized_pattern}"
+
+
+def _literal_glob_prefix(pattern: str) -> str:
+    parts = []
+    for segment in _normalize_glob_path(pattern).split("/"):
+        if not segment or any(ch in segment for ch in _GLOB_SPECIAL_CHARS):
+            break
+        parts.append(segment)
+    return "/".join(parts)
+
+
+def _join_uri_path(uri: str, suffix: str) -> str:
+    normalized_uri = _normalize_uri_for_glob(uri)
+    suffix = suffix.strip("/")
+    if not suffix:
+        return normalized_uri
+    if normalized_uri == "viking://":
+        return f"viking://{suffix}"
+    return f"{normalized_uri}/{suffix}"
+
+
+def _rel_path_sort_key(uri: str, root_uri: str) -> List[str]:
+    normalized_root = _normalize_uri_for_glob(root_uri)
+    normalized_uri = uri.rstrip("/")
+    if normalized_uri == normalized_root:
+        rel_path = ""
+    elif normalized_root == "viking://":
+        rel_path = normalized_uri[len("viking://") :]
+    elif normalized_uri.startswith(normalized_root + "/"):
+        rel_path = normalized_uri[len(normalized_root) + 1 :]
+    else:
+        rel_path = normalized_uri
+    return [part for part in rel_path.split("/") if part and part != "."]
 
 
 class _OpsMixin:
@@ -75,25 +148,17 @@ class _OpsMixin:
         real_ctx = self._ctx_or_default(ctx)
         uri = await self.resolve_uri(uri, real_ctx)
         await self._ensure_access(uri, ctx)
-        primary_path = self._uri_to_path(uri, ctx=ctx)
+        path = self._uri_to_path(uri, ctx=ctx)
 
         # Decryption + offset/size slicing now happen inside the ragfs encryption layer
         # (when configured); the plaintext stack reads bytes directly. Either way, pass the
         # offset/size through and let the Rust layer return the requested slice.
-        last_not_found: Optional[Exception] = None
-        for path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, path, primary_path, real_ctx):
-                continue
-            try:
-                result = await self._async_agfs.read(path, offset, size)
-                break
-            except Exception as exc:
-                if is_not_found_error(exc):
-                    last_not_found = exc
-                    continue
-                raise
-        else:
-            raise NotFoundError(uri, "file") from last_not_found
+        try:
+            result = await self._async_agfs.read(path, offset, size)
+        except Exception as exc:
+            if is_not_found_error(exc):
+                raise NotFoundError(uri, "file") from exc
+            raise
         if isinstance(result, bytes):
             raw = result
         elif result is not None and hasattr(result, "content"):
@@ -147,6 +212,8 @@ class _OpsMixin:
         ctx: Optional[RequestContext] = None,
         lease_ref: Dict[str, Any] | None = None,
         auto_pathlock: bool = True,
+        *,
+        no_vector: bool = False,
     ) -> Dict[str, Any]:
         """Delete file/directory + recursively update vector index.
 
@@ -156,6 +223,11 @@ class _OpsMixin:
         Acquires a path lock, deletes VectorDB records, then FS files.
         Raises ResourceBusyError when the target is locked by an ongoing
         operation (e.g. semantic processing).
+
+        Set ``no_vector`` only when the caller guarantees the target subtree
+        has no vector/context records. This skips vector cleanup and directory traversal
+        unless descendant ACL checks require it. Namespace permission checks
+        and path locking still apply.
 
         When ``auto_pathlock`` is False and no outer ``lease_ref`` is supplied,
         the VikingFS-level tree/exact lease is skipped and the underlying AGFS
@@ -188,6 +260,18 @@ class _OpsMixin:
                 logger.warning(f"[VikingFS] Failed to count nodes before delete: {e}")
                 return 0
 
+        async def _finish_missing_delete() -> Dict[str, Any]:
+            """Clean orphan index records for an idempotent delete."""
+            if no_vector:
+                return {"estimated_deleted_count": 0}
+            uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
+            uris_to_delete.append(target_uri)
+            real_ctx = self._ctx_or_default(ctx)
+            estimated_count = await _estimate_deleted_count(path, real_ctx)
+            await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
+            logger.info(f"[VikingFS] rm target not found, cleaned orphan index: {uri}")
+            return {"estimated_deleted_count": estimated_count}
+
         # Check existence and determine lock strategy
         try:
             stat = await self._async_agfs.stat(path)
@@ -200,19 +284,12 @@ class _OpsMixin:
                 raise
             if recursive:
                 await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
-            # Path does not exist: clean up any orphan index records and return
-            uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
-            uris_to_delete.append(target_uri)
-            real_ctx = self._ctx_or_default(ctx)
-            estimated_count = await _estimate_deleted_count(path, real_ctx)
-            await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
-            logger.info(f"[VikingFS] rm target not found, cleaned orphan index: {uri}")
-            return {"estimated_deleted_count": estimated_count}
+            return await _finish_missing_delete()
 
         if is_dir:
             await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
             if not recursive:
-                raise FailedPreconditionError(
+                raise InvalidArgumentError(
                     f"Cannot remove directory without --recursive: {uri}",
                     details={"resource": uri, "expected_flag": "recursive"},
                 )
@@ -233,22 +310,40 @@ class _OpsMixin:
                 raise ResourceBusyError(f"Resource is being processed: {uri}", uri=uri)
 
         try:
+            if lease_ref is None and lease is not None:
+                try:
+                    await self._async_agfs.stat(path)
+                except Exception as exc:
+                    if is_not_found_error(exc):
+                        return await _finish_missing_delete()
+                    mapped = map_exception(exc, resource=uri)
+                    if mapped is not None:
+                        raise mapped from exc
+                    raise
+
+            check_descendant_acl = (
+                is_dir
+                and (not no_vector or is_acl_uri(target_uri))
+                and await self._acl_enabled(ctx)
+            )
             uris_to_delete = (
                 await self._collect_uris(
                     path,
                     recursive,
                     ctx=ctx,
-                    strict=is_dir and self._acl_enabled(ctx),
+                    strict=check_descendant_acl,
                 )
-                if is_dir
+                if is_dir and (not no_vector or check_descendant_acl)
                 else []
             )
             uris_to_delete.append(target_uri)
             if is_dir:
                 await self._ensure_access_many(uris_to_delete, ctx, action=AclAction.MANAGE)
-            real_ctx = self._ctx_or_default(ctx)
-            estimated_count = await _estimate_deleted_count(path, real_ctx)
-            await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
+            estimated_count = 0
+            if not no_vector:
+                real_ctx = self._ctx_or_default(ctx)
+                estimated_count = await _estimate_deleted_count(path, real_ctx)
+                await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
             try:
                 result = await self._async_agfs.rm(
                     path,
@@ -257,13 +352,13 @@ class _OpsMixin:
                     auto_pathlock=auto_pathlock,
                 )
             except AGFSDirectoryNotEmptyError:
-                raise FailedPreconditionError(
+                raise InvalidArgumentError(
                     f"Directory not empty: {uri}. Use recursive=True to delete non-empty directories."
                 )
             except RuntimeError as e:
                 # Fallback for older versions without typed exceptions
                 if _is_directory_not_empty_error(str(e)):
-                    raise FailedPreconditionError(
+                    raise InvalidArgumentError(
                         f"Directory not empty: {uri}. Use recursive=True to delete non-empty directories."
                     )
                 raise
@@ -315,8 +410,11 @@ class _OpsMixin:
         recursive: bool = False,
         ctx: Optional[RequestContext] = None,
         lease_ref: Dict[str, Any] | None = None,
+        *,
+        maintain_vectors: bool = True,
+        copy_semantic_sidecars: bool = True,
     ) -> Dict[str, Any]:
-        """Copy a file or directory together with its vector records."""
+        """Copy a file or directory, optionally including semantic state."""
         old_uri = self._normalize_transfer_uri(old_uri)
         new_uri = self._normalize_transfer_uri(new_uri)
         await self._ensure_copy_source_access(old_uri, recursive=recursive, ctx=ctx)
@@ -342,7 +440,7 @@ class _OpsMixin:
             raise
         is_dir = stat.get("isDir", False) if isinstance(stat, dict) else False
         if is_dir and not recursive:
-            raise FailedPreconditionError(
+            raise InvalidArgumentError(
                 f"Cannot copy directory without --recursive: {old_uri}",
                 details={"resource": old_uri, "expected_flag": "recursive"},
             )
@@ -378,23 +476,26 @@ class _OpsMixin:
                 is_dir=is_dir,
                 ctx=ctx,
                 lease_ref=lease,
+                copy_semantic_sidecars=copy_semantic_sidecars,
             )
-            try:
-                vector_result = await self._copy_vector_store_uris(
-                    old_uri,
-                    new_uri,
-                    recursive=is_dir,
-                    ctx=ctx,
-                    **({"source_uris": source_uris} if is_dir else {}),
-                )
-            except Exception:
+            vector_result = None
+            if maintain_vectors:
                 try:
-                    await self._cleanup_transfer_target(
-                        new_path, is_dir=is_dir, ctx=ctx, lease_ref=lease
+                    vector_result = await self._copy_vector_store_uris(
+                        old_uri,
+                        new_uri,
+                        recursive=is_dir,
+                        ctx=ctx,
+                        **({"source_uris": source_uris} if is_dir else {}),
                     )
                 except Exception:
-                    logger.warning("Failed to clean copy target %s", new_uri, exc_info=True)
-                raise
+                    try:
+                        await self._cleanup_transfer_target(
+                            new_path, is_dir=is_dir, ctx=ctx, lease_ref=lease
+                        )
+                    except Exception:
+                        logger.warning("Failed to clean copy target %s", new_uri, exc_info=True)
+                    raise
             result: Dict[str, Any] = {
                 "operation_id": operation_id,
                 "operation": "copy",
@@ -574,6 +675,7 @@ class _OpsMixin:
         is_dir: bool,
         ctx: Optional[RequestContext],
         lease_ref: Dict[str, Any],
+        copy_semantic_sidecars: bool = True,
     ) -> int:
         if is_dir:
             return await self._copy_directory_under_tree_locks(
@@ -583,6 +685,7 @@ class _OpsMixin:
                 new_uri=new_uri,
                 ctx=ctx,
                 lease_ref=lease_ref,
+                copy_semantic_sidecars=copy_semantic_sidecars,
             )
 
         await self._async_agfs.cp(
@@ -613,6 +716,9 @@ class _OpsMixin:
         new_uri: str,
         ctx: Optional[RequestContext] = None,
         lease_ref: Dict[str, Any] | None = None,
+        *,
+        vector_mode: Literal["transfer", "delete_source", "none"] = "transfer",
+        copy_semantic_sidecars: bool = True,
     ) -> Dict[str, Any]:
         """Move file/directory while extending an optional outer pathlock lease.
 
@@ -623,7 +729,7 @@ class _OpsMixin:
         old_uri = self._normalize_transfer_uri(old_uri)
         new_uri = self._normalize_transfer_uri(new_uri)
         acl_manager = self.acl_manager
-        acl_enabled = self._acl_enabled(ctx)
+        acl_enabled = await self._acl_enabled(ctx)
         guard_ctx = replace(self._ctx_or_default(ctx), bypass_acl=True)
         await self._ensure_access(old_uri, guard_ctx, action=AclAction.MANAGE)
         await self._ensure_access(old_uri, ctx, action=AclAction.WRITE)
@@ -712,6 +818,7 @@ class _OpsMixin:
                         is_temp=is_temp,
                         ctx=ctx,
                         lease_ref=lease,
+                        copy_semantic_sidecars=copy_semantic_sidecars,
                     )
                     or 0
                 )
@@ -729,18 +836,24 @@ class _OpsMixin:
                         )
                 raise
 
-            # Update VectorDB URIs (on failure, clean up the copy)
+            # Update or remove source VectorDB records before deleting the source.
             vector_transfer_completed = False
             try:
-                vector_result = await self._update_vector_store_uris(
-                    old_uri,
-                    new_uri,
-                    recursive=is_dir,
-                    ctx=ctx,
-                    **({"source_uris": uris_to_move} if is_dir else {}),
-                )
-                vector_transfer_completed = True
-                if acl_manager is not None and new_acl_scope:
+                vector_result = None
+                if vector_mode == "transfer":
+                    vector_result = await self._update_vector_store_uris(
+                        old_uri,
+                        new_uri,
+                        recursive=is_dir,
+                        ctx=ctx,
+                        **({"source_uris": uris_to_move} if is_dir else {}),
+                    )
+                    vector_transfer_completed = True
+                elif vector_mode == "delete_source":
+                    await self._delete_from_vector_store(uris_to_move, ctx=ctx)
+                elif vector_mode != "none":
+                    raise ValueError(f"unsupported move vector mode: {vector_mode}")
+                if vector_mode == "transfer" and acl_manager is not None and new_acl_scope:
                     await acl_manager.refresh_context_subtree(
                         new_uri,
                         self._ctx_or_default(ctx),
@@ -813,6 +926,7 @@ class _OpsMixin:
         is_temp: bool,
         ctx: Optional[RequestContext] = None,
         lease_ref: Dict[str, Any] | None = None,
+        copy_semantic_sidecars: bool = True,
     ) -> int:
         """Copy source to destination for mv without deleting source."""
         del is_temp
@@ -826,6 +940,7 @@ class _OpsMixin:
             is_dir=is_dir,
             ctx=ctx,
             lease_ref=lease_ref,
+            copy_semantic_sidecars=copy_semantic_sidecars,
         )
 
     async def _copy_directory_under_tree_locks(
@@ -838,6 +953,7 @@ class _OpsMixin:
         lease_ref: Dict[str, Any] | None,
         transfer_source_uri: str | None = None,
         transfer_target_uri: str | None = None,
+        copy_semantic_sidecars: bool = True,
     ) -> int:
         """Copy a directory under the operation's source and target Tree leases.
 
@@ -890,9 +1006,12 @@ class _OpsMixin:
                     lease_ref=lease_ref,
                     transfer_source_uri=transfer_source_uri,
                     transfer_target_uri=transfer_target_uri,
+                    copy_semantic_sidecars=copy_semantic_sidecars,
                 )
             else:
                 if name in ABSTRACT_OVERVIEW_FILENAMES:
+                    if not copy_semantic_sidecars:
+                        continue
                     raw = await self._async_agfs.cat(old_child, fs_ctx=fs_ctx)
                     level = (
                         ContextLevel.ABSTRACT if name == ".abstract.md" else ContextLevel.OVERVIEW
@@ -995,15 +1114,21 @@ class _OpsMixin:
         return resolved
 
     async def stat(
-        self, uri: str, ctx: Optional[RequestContext] = None, skip_count: bool = False
+        self,
+        uri: str,
+        ctx: Optional[RequestContext] = None,
+        skip_count: bool = False,
+        include_lock_status: bool = False,
+        include_vector_fields: bool = True,
     ) -> Dict[str, Any]:
         """
         File/directory information.
 
-        example: {'name': 'resources', 'size': 128, 'mode': 2147484141, 'modTime': '2026-02-10T21:26:02.934376379+08:00', 'isDir': True, 'isLocked': False, 'count': 42, 'meta': {'Name': 'localfs', 'Type': 'local', 'Content': {'local_path': '...'}}}
+        example: {'name': 'resources', 'size': 128, 'mode': 2147484141, 'modTime': '2026-02-10T21:26:02.934376379+08:00', 'isDir': True, 'count': 42, 'meta': {'Name': 'localfs', 'Type': 'local', 'Content': {'local_path': '...'}}}
 
         Extra fields:
-            isLocked (bool): Whether the path is currently held by a path lock
+            isLocked (bool): When ``include_lock_status`` is True, whether the
+                path is currently held by a path lock
                 (either the path itself or any ancestor directory). Returns
                 False when the pathlock system is not enabled or the lookup
                 fails.
@@ -1023,47 +1148,31 @@ class _OpsMixin:
             skip_count: If True, skip the vector_store.count() call for directories.
                 Use this when the count field is not needed (e.g. in grep) to avoid
                 an extra VikingDB API call.
+            include_lock_status: If True, include ``isLocked`` in the result.
+                Leave disabled for internal metadata checks to avoid the extra
+                PathLock filesystem lookup.
         """
         real_ctx = self._ctx_or_default(ctx)
         uri = await self.resolve_uri(uri, real_ctx)
         await self._ensure_access(uri, ctx)
-        primary_path = self._uri_to_path(uri, ctx=ctx)
-        path = primary_path
-        last_not_found: Optional[Exception] = None
-        for candidate_path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, candidate_path, primary_path, real_ctx):
-                continue
-            try:
-                result = await self._async_agfs.stat(candidate_path)
-                path = candidate_path
-                break
-            except Exception as exc:
-                if is_not_found_error(exc):
-                    last_not_found = exc
-                    continue
-                raise
-        else:
-            if self._is_session_root_uri(uri):
-                now = datetime.now(timezone.utc).isoformat()
-                return {
-                    "name": "session",
-                    "size": 0,
-                    "mode": 0o755,
-                    "modTime": now,
-                    "isDir": True,
-                    "isLocked": False,
-                }
-            raise NotFoundError(uri, "file") from last_not_found
+        path = self._uri_to_path(uri, ctx=ctx)
+        try:
+            result = await self._async_agfs.stat(path)
+        except Exception as exc:
+            if is_not_found_error(exc):
+                raise NotFoundError(uri, "file") from exc
+            raise
         if isinstance(result, dict):
             result["uri"] = uri
-            result["isLocked"] = await self._is_path_locked_async(path)
+            if include_lock_status:
+                result["isLocked"] = await self._is_path_locked_async(path)
             # Add deterministic vector record id for files (level 2).
             # This matches the ID used in VikingDB so callers can cross-reference
             # vector records without an extra lookup.
-            if not result.get("isDir", False):
+            if include_vector_fields and not result.get("isDir", False):
                 result["id"] = vector_record_id(real_ctx.account_id, uri, level=2)
             # Add count for directories if vector store available
-            if not skip_count and result.get("isDir", False):
+            if include_vector_fields and not skip_count and result.get("isDir", False):
                 try:
                     vector_store = self._get_vector_store()
                     if vector_store:
@@ -1089,14 +1198,7 @@ class _OpsMixin:
         self._safe_uri_parts(uri)
         if not self._is_accessible(uri, real_ctx):
             return False
-
-        primary_path = self._uri_to_path(uri, ctx=ctx)
-        for candidate_path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, candidate_path, primary_path, real_ctx):
-                continue
-            if await self._agfs_path_exists(candidate_path):
-                return True
-        return self._is_session_root_uri(uri)
+        return await self._agfs_path_exists(self._uri_to_path(uri, ctx=ctx))
 
     async def glob(
         self,
@@ -1105,6 +1207,8 @@ class _OpsMixin:
         node_limit: Optional[int] = None,
         ctx: Optional[RequestContext] = None,
         extra_fields: Optional[List[str]] = None,
+        tag_filter: Optional[Dict[str, Any]] = None,
+        force_fs: bool = False,
     ) -> Dict:
         """File pattern matching, supports **/*.md recursive.
 
@@ -1118,20 +1222,29 @@ class _OpsMixin:
         real_ctx = self._ctx_or_default(ctx)
         return_entries = extra_fields is not None
         aug_fields = list(extra_fields) if extra_fields else []
-        primary_path = self._uri_to_path(uri, ctx=ctx)
-        path: Optional[str] = None
-        for candidate_path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, candidate_path, primary_path, real_ctx):
-                continue
-            if await self._agfs_path_exists(candidate_path):
-                path = candidate_path
-                break
-        if path is None:
-            if self._is_session_root_uri(uri):
-                return {"matches": [], "count": 0}
+        path = self._uri_to_path(uri, ctx=ctx)
+        if not await self._agfs_path_exists(path):
             raise NotFoundError(uri, "directory")
 
-        page_size = self._glob_page_size(node_limit)
+        if not force_fs:
+            remote_result = await self._try_glob_vikingdb(
+                pattern=pattern,
+                uri=uri,
+                node_limit=node_limit,
+                return_entries=return_entries,
+                extra_fields=aug_fields,
+                tag_filter=tag_filter,
+                ctx=real_ctx,
+            )
+            if remote_result is not None:
+                return remote_result
+
+        # Tag filtering happens in FSService on the local fallback path. Fetch
+        # all matches so an early filesystem limit cannot discard later tagged
+        # entries. The remote path applies the same filter before its limit.
+        acl_enabled = await self._acl_enabled(real_ctx)
+        fs_node_limit = None if tag_filter else node_limit
+        page_size = self._glob_page_size(fs_node_limit)
         continuation_token: Optional[str] = None
         matches = []
         while True:
@@ -1153,9 +1266,8 @@ class _OpsMixin:
                     entry.get("name") or entry["path"].rsplit("/", 1)[-1],
                     path,
                     real_ctx,
+                    acl_enabled=acl_enabled,
                 ):
-                    continue
-                if not await self._read_path_visible(uri, entry["path"], primary_path, real_ctx):
                     continue
                 entry_uri = self._alias_uri_for_path(
                     request_uri=uri,
@@ -1186,12 +1298,16 @@ class _OpsMixin:
                     matches.append(entry_stat)
                 else:
                     matches.append(match_uri)
-                if node_limit is not None and node_limit > 0 and len(matches) >= node_limit:
+                if (
+                    fs_node_limit is not None
+                    and fs_node_limit > 0
+                    and len(matches) >= fs_node_limit
+                ):
                     if return_entries:
                         await self._augment_entries_extra_fields(matches, aug_fields, ctx=ctx)
                     return {"matches": matches, "count": len(matches)}
 
-            if node_limit is not None and node_limit > 0 and len(matches) >= node_limit:
+            if fs_node_limit is not None and fs_node_limit > 0 and len(matches) >= fs_node_limit:
                 if return_entries:
                     await self._augment_entries_extra_fields(matches, aug_fields, ctx=ctx)
                 return {"matches": matches, "count": len(matches)}
@@ -1202,26 +1318,324 @@ class _OpsMixin:
             await self._augment_entries_extra_fields(matches, aug_fields, ctx=ctx)
         return {"matches": matches, "count": len(matches)}
 
+    async def _try_glob_vikingdb(
+        self,
+        *,
+        pattern: str,
+        uri: str,
+        node_limit: Optional[int],
+        return_entries: bool,
+        extra_fields: List[str],
+        tag_filter: Optional[Dict[str, Any]],
+        ctx: RequestContext,
+    ) -> Optional[Dict[str, Any]]:
+        if not await self._should_use_vikingdb_glob(
+            pattern=pattern,
+            uri=uri,
+            node_limit=node_limit,
+            ctx=ctx,
+        ):
+            return None
+
+        vector_store = self._get_vector_store()
+        if vector_store is None or not hasattr(vector_store, "search_by_random"):
+            return None
+
+        remote_limit = self._remote_glob_limit(node_limit)
+        filter_expr = self._remote_glob_filter(uri, pattern)
+        if tag_filter:
+            filter_expr = And([filter_expr, RawDSL(tag_filter)])
+        full_pattern = _uri_to_remote_path_pattern(uri, pattern)
+        advance = {
+            "post_process_input_limit": _REMOTE_GLOB_POST_PROCESS_INPUT_LIMIT,
+            "post_process_ops": [
+                {
+                    "op": "path_glob",
+                    "field": "uri",
+                    "pattern": full_pattern,
+                    "stop_after_matches": remote_limit,
+                }
+            ],
+        }
+
+        try:
+            records = await vector_store.search_by_random(
+                filter=filter_expr,
+                limit=remote_limit,
+                offset=0,
+                output_fields=self._remote_glob_output_fields(
+                    extra_fields,
+                    return_entries=return_entries,
+                ),
+                advance=advance,
+                ctx=ctx,
+            )
+        except Exception as exc:
+            logger.warning("glob vikingdb step failed, falling back to fs: %s", exc)
+            return None
+
+        entries = self._remote_glob_records_to_entries(
+            records,
+            root_uri=uri,
+            ctx=ctx,
+        )
+        entries.sort(key=lambda entry: _rel_path_sort_key(str(entry.get("uri", "")), uri))
+        access = await self._can_access_many(
+            [entry["uri"] for entry in entries],
+            ctx,
+        )
+        entries = [entry for entry in entries if access.get(entry["uri"], False)]
+        if node_limit is not None and node_limit > 0:
+            entries = entries[:node_limit]
+
+        if return_entries:
+            await self._fill_remote_glob_entry_fields(entries, extra_fields, ctx=ctx)
+            return {"matches": entries, "count": len(entries)}
+
+        return {
+            "matches": [_glob_match_uri(entry["uri"], entry.get("isDir")) for entry in entries],
+            "count": len(entries),
+        }
+
+    async def _should_use_vikingdb_glob(
+        self,
+        *,
+        pattern: str,
+        uri: str,
+        node_limit: Optional[int],
+        ctx: RequestContext,
+    ) -> bool:
+        if node_limit is not None and node_limit <= 0:
+            return False
+        if not _normalize_glob_path(pattern):
+            return False
+
+        glob_config = getattr(self, "glob_config", None)
+        engine = getattr(glob_config, "engine", "fs")
+        if engine == "fs":
+            return False
+
+        vector_store = self._get_vector_store()
+        if vector_store is None:
+            return False
+
+        backend_type = (await vector_store.get_account_backend(ctx.account_id))._mode
+        if backend_type not in ("volcengine", "vikingdb"):
+            return False
+
+        if not await self._collection_has_glob_uri_field(vector_store, ctx):
+            return False
+
+        threshold = getattr(glob_config, "switch_to_remote_threshold", 100)
+        if threshold == 0:
+            return True
+
+        try:
+            scoped_uri = self._remote_glob_scoped_uri(uri, pattern)
+            count = await self._get_cached_count(scoped_uri, ctx)
+        except Exception:
+            logger.debug(
+                "glob engine=auto: count() check failed, falling back to fs", exc_info=True
+            )
+            return False
+        return count >= threshold
+
+    async def _collection_has_glob_uri_field(self, vector_store: Any, ctx: RequestContext) -> bool:
+        try:
+            if not hasattr(vector_store, "get_collection_meta"):
+                return False
+            meta = await vector_store.get_collection_meta(ctx=ctx)
+            fields = meta.get("Fields", []) if isinstance(meta, dict) else []
+            return any(
+                field.get("FieldName") == "uri" for field in fields if isinstance(field, dict)
+            )
+        except Exception:
+            logger.debug(
+                "Failed to check collection uri field, assuming no path_glob support", exc_info=True
+            )
+            return False
+
+    @staticmethod
+    def _remote_glob_limit(node_limit: Optional[int]) -> int:
+        if node_limit is None:
+            return _REMOTE_GLOB_DEFAULT_LIMIT
+        return min(max(math.ceil(node_limit * 1.2), 1), _REMOTE_GLOB_MAX_LIMIT)
+
+    @staticmethod
+    def _remote_glob_output_fields(
+        extra_fields: List[str],
+        *,
+        return_entries: bool,
+    ) -> List[str]:
+        fields = list(_REMOTE_GLOB_OUTPUT_FIELDS)
+        if return_entries:
+            for field in _REMOTE_GLOB_ENTRY_FIELDS:
+                if field not in fields:
+                    fields.append(field)
+        local_only = _REMOTE_GLOB_LOCAL_STAT_FIELDS | _REMOTE_GLOB_LOCAL_COMPUTED_FIELDS
+        for field in extra_fields:
+            if field in local_only or field in fields:
+                continue
+            fields.append(field)
+        return fields
+
+    @staticmethod
+    def _remote_glob_scoped_uri(uri: str, pattern: str) -> str:
+        prefix = _literal_glob_prefix(pattern)
+        return _join_uri_path(uri, prefix) if prefix else _normalize_uri_for_glob(uri)
+
+    def _remote_glob_filter(self, uri: str, pattern: str) -> PathScope:
+        scoped_uri = self._remote_glob_scoped_uri(uri, pattern)
+        return PathScope("uri", scoped_uri, depth=-1)
+
+    def _remote_glob_records_to_entries(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        root_uri: str,
+        ctx: RequestContext,
+    ) -> List[Dict[str, Any]]:
+        seen: set[str] = set()
+        entries: List[Dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            entry_uri = record.get("uri")
+            if not isinstance(entry_uri, str) or not entry_uri:
+                continue
+            entry_uri = _normalize_uri_for_glob(entry_uri)
+            if entry_uri in seen:
+                continue
+            seen.add(entry_uri)
+
+            level = record.get("level")
+            is_dir = level != 2 if level is not None else bool(record.get("isDir", False))
+            name = record.get("name") or entry_uri.rstrip("/").rsplit("/", 1)[-1]
+            if not self._is_remote_glob_uri_visible(
+                entry_uri,
+                str(name),
+                bool(is_dir),
+                root_uri,
+                ctx,
+            ):
+                continue
+            if not self._is_accessible(entry_uri, ctx):
+                continue
+
+            entry = dict(record)
+            entry["uri"] = entry_uri
+            entry["name"] = entry.get("name") or name
+            entry["isDir"] = bool(is_dir)
+            entries.append(entry)
+        return entries
+
+    def _is_remote_glob_uri_visible(
+        self,
+        entry_uri: str,
+        name: str,
+        is_dir: bool,
+        root_uri: str,
+        ctx: RequestContext,
+    ) -> bool:
+        try:
+            entry_parts = self._safe_uri_parts(entry_uri)
+            root_parts = self._safe_uri_parts(root_uri)
+        except ValueError:
+            return False
+
+        if root_parts and entry_parts[: len(root_parts)] != root_parts:
+            return False
+        if not root_parts and entry_parts:
+            if entry_parts[0] not in VikingURI.LISTABLE_SCOPES:
+                return False
+
+        relative_parts = entry_parts[len(root_parts) :]
+        if not is_dir and name.startswith("."):
+            return False
+        if is_storage_internal_name(name):
+            return False
+        return not any(is_storage_internal_name(part) for part in relative_parts)
+
+    async def _fill_remote_glob_entry_fields(
+        self,
+        entries: List[Dict[str, Any]],
+        extra_fields: List[str],
+        ctx: Optional[RequestContext] = None,
+    ) -> None:
+        requested_stat_fields = {
+            field for field in extra_fields if field in _REMOTE_GLOB_LOCAL_STAT_FIELDS
+        }
+        required_fields = set(_REMOTE_GLOB_ENTRY_FIELDS) | requested_stat_fields
+        for entry in entries:
+            entry.pop("level", None)
+            entry.pop("_score", None)
+        for entry in entries:
+            if all(field in entry for field in required_fields):
+                if entry.get("isDir"):
+                    entry.pop("id", None)
+                continue
+            entry_uri = entry.get("uri")
+            if not entry_uri:
+                continue
+            try:
+                stat = await self.stat(entry_uri, ctx=ctx, skip_count=True)
+            except Exception:
+                continue
+            stat.update({k: v for k, v in entry.items() if v is not None})
+            entry.clear()
+            entry.update(stat)
+            if entry.get("isDir"):
+                entry.pop("id", None)
+        if extra_fields:
+            await self._augment_entries_extra_fields(entries, extra_fields, ctx=ctx)
+
     async def _batch_fetch_abstracts(
         self,
         entries: List[Dict[str, Any]],
         abs_limit: int,
         ctx: Optional[RequestContext] = None,
     ) -> None:
-        """Batch fetch abstracts for entries using a fixed-size worker pool.
+        """Batch fetch abstracts for directory entries."""
+        await self._batch_fetch_directory_summaries(
+            entries,
+            field="abstract",
+            limit=abs_limit,
+            reader=self._read_abstract_for_known_dir,
+            fallback="[.abstract.md is not ready]",
+            ctx=ctx,
+        )
 
-        Non-directory entries receive an empty abstract immediately.
-        Directory entries are processed concurrently via a worker pool,
-        using _read_abstract_for_known_dir to skip redundant stat() calls.
+    async def _batch_fetch_overviews(
+        self,
+        entries: List[Dict[str, Any]],
+        overview_limit: int,
+        ctx: Optional[RequestContext] = None,
+    ) -> None:
+        """Batch fetch overviews for directory entries."""
+        await self._batch_fetch_directory_summaries(
+            entries,
+            field="overview",
+            limit=overview_limit,
+            reader=self.overview,
+            fallback="[.overview.md is not ready]",
+            ctx=ctx,
+        )
 
-        Args:
-            entries: List of entries to fetch abstracts for
-            abs_limit: Maximum length for abstract truncation
-        """
+    async def _batch_fetch_directory_summaries(
+        self,
+        entries: List[Dict[str, Any]],
+        *,
+        field: str,
+        limit: int,
+        reader: Callable[..., Awaitable[str]],
+        fallback: str,
+        ctx: Optional[RequestContext] = None,
+    ) -> None:
+        """Load one summary field for directories with a fixed-size worker pool."""
         dir_jobs = []
         for index, entry in enumerate(entries):
             if not entry.get("isDir", False):
-                entry["abstract"] = ""
+                entry[field] = ""
                 continue
             dir_jobs.append((index, entry))
 
@@ -1244,18 +1658,18 @@ class _OpsMixin:
                     cursor += 1
 
                 try:
-                    abstract = await self._read_abstract_for_known_dir(entry["uri"], ctx=ctx)
+                    summary = await reader(entry["uri"], ctx=ctx)
                 except Exception:
-                    abstract = "[.abstract.md is not ready]"
+                    summary = fallback
 
-                results[index] = abstract
+                results[index] = summary
 
         await asyncio.gather(*(worker() for _ in range(worker_count)))
 
-        for index, abstract in results.items():
-            if len(abstract) > abs_limit:
-                abstract = abstract[: abs_limit - 3] + "..."
-            entries[index]["abstract"] = abstract
+        for index, summary in results.items():
+            if len(summary) > limit:
+                summary = "." * limit if limit <= 3 else summary[: limit - 3] + "..."
+            entries[index][field] = summary
 
     async def _finalize_listing_entries(
         self,
@@ -1265,6 +1679,9 @@ class _OpsMixin:
         extra_fields: Optional[List[str]],
         recursive: bool,
         ctx: Optional[RequestContext] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: bool = False,
+        overview_limit: int = 4000,
     ) -> List[Dict[str, Any]]:
         """Format and enrich entries after visible-page selection.
 
@@ -1279,9 +1696,15 @@ class _OpsMixin:
         Returns:
             Entries in the requested output format.
         """
+        load_abstract = output == "agent" if include_abstract is None else include_abstract
         if output == "original":
             if extra_fields:
                 await self._augment_entries_extra_fields(entries, extra_fields, ctx=ctx)
+            summary_entries = [entry for entry in entries if entry.get("access") != "denied"]
+            if load_abstract:
+                await self._batch_fetch_abstracts(summary_entries, abs_limit, ctx=ctx)
+            if include_overview:
+                await self._batch_fetch_overviews(summary_entries, overview_limit, ctx=ctx)
             return entries
         if output != "agent":
             raise ValueError(f"Invalid output format: {output}")
@@ -1324,11 +1747,11 @@ class _OpsMixin:
                 item["tags"] = entry["tags"]
             result.append(item)
 
-        await self._batch_fetch_abstracts(
-            [entry for entry in result if entry.get("access") != "denied"],
-            abs_limit,
-            ctx=ctx,
-        )
+        visible_entries = [entry for entry in result if entry.get("access") != "denied"]
+        if load_abstract:
+            await self._batch_fetch_abstracts(visible_entries, abs_limit, ctx=ctx)
+        if include_overview:
+            await self._batch_fetch_overviews(visible_entries, overview_limit, ctx=ctx)
         return result
 
     async def tree(
@@ -1344,6 +1767,10 @@ class _OpsMixin:
         offset: int = 0,
         sort_by: Optional[str] = None,
         sort_order: str = "asc",
+        directories_only: bool = False,
+        include_abstract: Optional[bool] = None,
+        include_overview: bool = False,
+        overview_limit: int = 4000,
     ) -> List[Dict[str, Any]]:
         """
         Recursively list all contents (includes rel_path).
@@ -1367,34 +1794,30 @@ class _OpsMixin:
             raise ValueError("offset must be non-negative")
         await self._ensure_access(uri, ctx)
         extra_fields = extra_fields or []
-        if output == "original":
-            entries = await self._tree_original(
-                uri,
-                show_all_hidden,
-                node_limit,
-                level_limit,
-                offset=offset,
-                sort_by=sort_by,
-                sort_order=sort_order,
-                ctx=ctx,
-            )
-        elif output == "agent":
-            entries = await self._tree_agent(
-                uri,
-                abs_limit,
-                show_all_hidden,
-                node_limit,
-                level_limit,
-                offset=offset,
-                sort_by=sort_by,
-                sort_order=sort_order,
-                ctx=ctx,
-            )
-        else:
+        if output not in {"original", "agent"}:
             raise ValueError(f"Invalid output format: {output}")
-        if extra_fields and output == "original":
-            await self._augment_entries_extra_fields(entries, extra_fields, ctx=ctx)
-        return entries
+        entries = await self._tree_original(
+            uri,
+            show_all_hidden=show_all_hidden,
+            directories_only=directories_only,
+            node_limit=node_limit,
+            level_limit=level_limit,
+            offset=offset,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            ctx=ctx,
+        )
+        return await self._finalize_listing_entries(
+            entries,
+            output,
+            abs_limit,
+            extra_fields,
+            True,
+            ctx=ctx,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+        )
 
     async def _tree_original(
         self,
@@ -1406,12 +1829,14 @@ class _OpsMixin:
         sort_by: Optional[str] = None,
         sort_order: str = "asc",
         ctx: Optional[RequestContext] = None,
+        directories_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """Recursively list all contents (original format)."""
         result = []
         async for entry, entry_uri in self._iter_visible_tree_entries(
             uri,
             show_all_hidden=show_all_hidden,
+            directories_only=directories_only,
             node_limit=node_limit,
             level_limit=level_limit,
             offset=offset,
@@ -1445,38 +1870,6 @@ class _OpsMixin:
             )
             result.append(new_entry)
         return result
-
-    async def _tree_agent(
-        self,
-        uri: str,
-        abs_limit: int,
-        show_all_hidden: bool = False,
-        node_limit: Optional[int] = 1000,
-        level_limit: Optional[int] = 3,
-        offset: int = 0,
-        sort_by: Optional[str] = None,
-        sort_order: str = "asc",
-        ctx: Optional[RequestContext] = None,
-    ) -> List[Dict[str, Any]]:
-        """Recursively list all contents (agent format with abstracts)."""
-        entries = await self._tree_original(
-            uri,
-            show_all_hidden,
-            node_limit,
-            level_limit,
-            offset=offset,
-            sort_by=sort_by,
-            sort_order=sort_order,
-            ctx=ctx,
-        )
-        return await self._finalize_listing_entries(
-            entries,
-            "agent",
-            abs_limit,
-            None,
-            True,
-            ctx=ctx,
-        )
 
     # ========== Vector Sync Helper Methods ==========
 
@@ -1595,6 +1988,21 @@ class _OpsMixin:
         await self._ensure_parent_dirs(path, ctx=ctx, lease_ref=lease_ref)
 
         if isinstance(content, str):
+            sanitizer = getattr(self, "_privacy_sanitizer", None)
+            if sanitizer is not None and ctx is not None:
+                result = await sanitizer.sanitize(content, ctx=ctx, uri=uri)
+                if result.ambiguous_references:
+                    raise InvalidArgumentError(
+                        "Content contains a Privacy value mapped to multiple fields; "
+                        "insert the intended owner-bound reference explicitly",
+                        details={
+                            "uri": uri,
+                            "candidate_references": [
+                                list(candidates) for candidates in result.ambiguous_references
+                            ],
+                        },
+                    )
+                content = result.content
             content = content.encode("utf-8")
 
         await self._async_agfs.write(
@@ -1624,23 +2032,15 @@ class _OpsMixin:
         real_ctx = self._ctx_or_default(ctx)
         uri = await self.resolve_uri(uri, real_ctx)
         await self._ensure_access(uri, ctx)
-        primary_path = self._uri_to_path(uri, ctx=ctx)
+        path = self._uri_to_path(uri, ctx=ctx)
         # Verify the file exists before reading, because AGFS read returns
         # empty bytes for non-existent files instead of raising an error.
-        last_not_found: Optional[Exception] = None
-        for path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, path, primary_path, real_ctx):
-                continue
-            try:
-                stat = await self._async_agfs.stat(path)
-                break
-            except Exception as exc:
-                if is_not_found_error(exc):
-                    last_not_found = exc
-                    continue
-                raise
-        else:
-            raise NotFoundError(uri, "file") from last_not_found
+        try:
+            stat = await self._async_agfs.stat(path)
+        except Exception as exc:
+            if is_not_found_error(exc):
+                raise NotFoundError(uri, "file") from exc
+            raise
         if isinstance(stat, dict) and stat.get("isDir", False):
             raise InvalidArgumentError(
                 f"Directory URI is not readable as a file: {uri}. "
@@ -1672,33 +2072,51 @@ class _OpsMixin:
         self,
         uri: str,
         ctx: Optional[RequestContext] = None,
+        max_bytes: Optional[int] = None,
     ) -> bytes:
         """Read single binary file. Accepts a Viking URI or a 32-char hex vector record id."""
+        if max_bytes is not None and max_bytes < 0:
+            raise InvalidArgumentError("max_bytes must be non-negative")
         real_ctx = self._ctx_or_default(ctx)
         uri = await self.resolve_uri(uri, real_ctx)
         await self._ensure_access(uri, ctx)
-        primary_path = self._uri_to_path(uri, ctx=ctx)
-        last_not_found: Optional[Exception] = None
-        for path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, path, primary_path, real_ctx):
-                continue
-            try:
-                stat = await self._async_agfs.stat(path)
-                break
-            except Exception as exc:
-                if is_not_found_error(exc):
-                    last_not_found = exc
-                    continue
-                raise
-        else:
-            raise NotFoundError(uri, "file") from last_not_found
+        path = self._uri_to_path(uri, ctx=ctx)
+        try:
+            stat = await self._async_agfs.stat(path)
+        except Exception as exc:
+            if is_not_found_error(exc):
+                raise NotFoundError(uri, "file") from exc
+            raise
         if isinstance(stat, dict) and stat.get("isDir", False):
             raise InvalidArgumentError(
                 f"Cannot read directory as file: {uri}",
                 details={"resource": uri, "expected": "file", "actual": "directory"},
             )
+        if max_bytes is not None:
+            size = stat.get("size") if isinstance(stat, dict) else None
+            if isinstance(size, int) and size > max_bytes:
+                raise ResourceExhaustedError(
+                    "File exceeds the configured read size limit",
+                    details={
+                        "uri": uri,
+                        "reason": "read_limit_exceeded",
+                        "size_bytes": size,
+                        "max_bytes": max_bytes,
+                    },
+                )
         try:
-            raw = self._handle_agfs_read(await self._async_agfs.read(path))
+            read_size = -1 if max_bytes is None else max_bytes + 1
+            raw = self._handle_agfs_read(await self._async_agfs.read(path, size=read_size))
+            if max_bytes is not None and len(raw) > max_bytes:
+                raise ResourceExhaustedError(
+                    "File exceeds the configured read size limit",
+                    details={
+                        "uri": uri,
+                        "reason": "read_limit_exceeded",
+                        "size_bytes": len(raw),
+                        "max_bytes": max_bytes,
+                    },
+                )
             return raw
         except Exception as exc:
             if is_not_found_error(exc):
@@ -1774,7 +2192,10 @@ class _OpsMixin:
 
         except Exception as e:
             logger.error(f"[VikingFS] Failed to append to file {uri}: {e}")
-            raise IOError(f"Failed to append to file {uri}: {e}")
+            mapped = map_exception(e, resource=uri, resource_type="file")
+            if mapped is not None:
+                raise mapped from e
+            raise IOError(f"Failed to append to file {uri}: {e}") from e
         finally:
             if owned_lease is not None:
                 await self._async_agfs.pathlock_release(owned_lease)
@@ -1784,6 +2205,9 @@ class _OpsMixin:
         uri: str,
         output: str = "original",
         abs_limit: int = 256,
+        include_abstract: Optional[bool] = None,
+        include_overview: bool = False,
+        overview_limit: int = 4000,
         show_all_hidden: bool = False,
         node_limit: int = 1000,
         sort_by: Optional[str] = None,
@@ -1798,7 +2222,10 @@ class _OpsMixin:
         Args:
             uri: Viking URI
             output: str = "original"
-            abs_limit: int = 256
+            abs_limit: Maximum returned abstract length
+            include_abstract: Include directory L0 abstracts; defaults to the output format
+            include_overview: Include directory L1 overviews
+            overview_limit: Maximum returned overview length
             show_all_hidden: bool = False (list all hidden files, like -a)
             node_limit: int = 1000 (maximum number of nodes to list)
             sort_by: Optional sort field, "name" or "mtime"
@@ -1817,122 +2244,27 @@ class _OpsMixin:
             raise ValueError("sort_by must be 'name' or 'mtime'")
         if sort_order not in {"asc", "desc"}:
             raise ValueError("sort_order must be 'asc' or 'desc'")
-        if output == "original":
-            entries = await self._ls_original(
-                uri,
-                show_all_hidden,
-                node_limit,
-                offset=offset,
-                sort_by=sort_by,
-                sort_order=sort_order,
-                ctx=ctx,
-            )
-        elif output == "agent":
-            entries = await self._ls_agent(
-                uri,
-                abs_limit,
-                show_all_hidden,
-                node_limit,
-                offset=offset,
-                sort_by=sort_by,
-                sort_order=sort_order,
-                ctx=ctx,
-            )
-        else:
+        if output not in {"original", "agent"}:
             raise ValueError(f"Invalid output format: {output}")
-        if extra_fields and output == "original":
-            await self._augment_entries_extra_fields(entries, extra_fields, ctx=ctx)
-        return entries
-
-    @staticmethod
-    def _ls_entry_mtime(entry: Dict[str, Any]) -> Optional[float]:
-        raw_time = entry.get("modTime")
-        if isinstance(raw_time, (int, float)):
-            return float(raw_time)
-        if isinstance(raw_time, str) and raw_time:
-            try:
-                return parse_iso_datetime(raw_time).timestamp()
-            except (TypeError, ValueError, OverflowError):
-                return None
-
-        legacy_time = entry.get("mtime")
-        if isinstance(legacy_time, (int, float)):
-            return float(legacy_time)
-        return None
-
-    @classmethod
-    def _sort_ls_entry_items(
-        cls,
-        entry_items: List[tuple[Dict[str, Any], str]],
-        sort_by: Optional[str],
-        sort_order: str,
-    ) -> List[tuple[Dict[str, Any], str]]:
-        if sort_by is None:
-            return entry_items
-
-        descending = sort_order == "desc"
-        directories = [item for item in entry_items if item[0].get("isDir", False)]
-        files = [item for item in entry_items if not item[0].get("isDir", False)]
-
-        def name_key(item: tuple[Dict[str, Any], str]) -> tuple[str, str]:
-            """Return the case-insensitive and original entry name."""
-            name = str(item[0].get("name", ""))
-            return name.lower(), name
-
-        if sort_by == "name":
-            directories.sort(key=name_key, reverse=descending)
-            files.sort(key=name_key, reverse=descending)
-            return directories + files
-
-        def sort_by_mtime(
-            items: List[tuple[Dict[str, Any], str]],
-        ) -> List[tuple[Dict[str, Any], str]]:
-            timestamped = []
-            missing = []
-            for item in items:
-                timestamp = cls._ls_entry_mtime(item[0])
-                if timestamp is None:
-                    missing.append(item)
-                else:
-                    timestamped.append((timestamp, item))
-            timestamped.sort(key=lambda pair: name_key(pair[1]))
-            timestamped.sort(
-                key=lambda pair: pair[0],
-                reverse=descending,
-            )
-            missing.sort(key=name_key)
-            return [item for _, item in timestamped] + missing
-
-        return sort_by_mtime(directories) + sort_by_mtime(files)
-
-    async def _ls_agent(
-        self,
-        uri: str,
-        abs_limit: int,
-        show_all_hidden: bool,
-        node_limit: int = 1000,
-        offset: int = 0,
-        sort_by: Optional[str] = None,
-        sort_order: str = "asc",
-        ctx: Optional[RequestContext] = None,
-    ) -> List[Dict[str, Any]]:
-        """List directory contents (URI version)."""
         entries = await self._ls_original(
             uri,
-            show_all_hidden=show_all_hidden,
+            show_all_hidden,
+            node_limit,
             offset=offset,
-            node_limit=node_limit,
             sort_by=sort_by,
             sort_order=sort_order,
             ctx=ctx,
         )
         return await self._finalize_listing_entries(
             entries,
-            "agent",
+            output,
             abs_limit,
-            None,
+            extra_fields,
             False,
             ctx=ctx,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
         )
 
     async def _ls_original(
@@ -1967,15 +2299,35 @@ class _OpsMixin:
                     "access": "denied",
                 }
             else:
-                new_entry = dict(entry)
+                new_entry = self._normalize_ls_entry(dict(entry))
                 new_entry["uri"] = entry_uri
-            if entry.get("isDir"):
+            if new_entry.get("isDir"):
                 all_entries.append(new_entry)
             elif not name.startswith("."):
                 all_entries.append(new_entry)
             elif show_all_hidden:
                 all_entries.append(new_entry)
         return all_entries
+
+    @staticmethod
+    def _normalize_ls_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill synthetic metadata for virtual directory rows (#4859).
+
+        S3/TOS CommonPrefixes under ``directory_marker_mode=none`` may omit
+        ``modTime`` / ``size``. Keep those rows listable instead of letting
+        downstream WebDAV/CLI paths treat them as incomplete and drop them.
+        """
+        is_dir = bool(entry.get("isDir", False))
+        mode = entry.get("mode")
+        # Some backends omit isDir but still advertise a directory mode bit.
+        if not is_dir and isinstance(mode, int) and (mode & 0o170000) == 0o040000:
+            is_dir = True
+            entry["isDir"] = True
+        if is_dir:
+            entry.setdefault("size", 0)
+            if not entry.get("modTime") and entry.get("mtime") is None:
+                entry["modTime"] = format_iso8601(datetime.now(timezone.utc))
+        return entry
 
     async def _ls_browsable_items(
         self,
@@ -1996,9 +2348,9 @@ class _OpsMixin:
         raw_offset = 0
         raw_limit = None if node_limit is None else max(node_limit, 256)
         remaining_offset = offset
-        merge_paths = self._legacy_session_alias(uri) is not None
         browsable: List[tuple[Dict[str, Any], str]] = []
-        expose_resource_names = self._acl_enabled(ctx) and is_acl_uri(uri)
+        acl_enabled = await self._acl_enabled(ctx)
+        expose_resource_names = acl_enabled and is_acl_uri(uri)
 
         while True:
             entry_items, consumed, exhausted = await self._list_read_path_items(
@@ -2009,8 +2361,6 @@ class _OpsMixin:
                 sort_order=sort_order,
                 ctx=ctx,
             )
-            if merge_paths:
-                entry_items = self._sort_ls_entry_items(entry_items, sort_by, sort_order)
             entry_items = [
                 item
                 for item in entry_items
@@ -2168,7 +2518,7 @@ class _OpsMixin:
         parts = [p for p in path.strip("/").split("/") if p]
         if len(parts) == 2 and parts[0] == "local":
             return [e for e in entries if e.get("name") in VikingURI.LISTABLE_SCOPES]
-        return [e for e in entries if e.get("name") not in STORAGE_INTERNAL_ENTRY_NAMES]
+        return [e for e in entries if not is_storage_internal_name(str(e.get("name", "")))]
 
     async def _ls_entries(
         self,

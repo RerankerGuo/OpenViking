@@ -90,6 +90,8 @@ class FakeVikingFS:
         ]
 
     async def read_file(self, uri: str, ctx=None):
+        if uri not in self.files:
+            raise FileNotFoundError(uri)
         return self.files[uri]
 
     async def write_file(self, uri: str, content: str, ctx=None, lease_ref=None):
@@ -750,6 +752,85 @@ async def test_patch_merge_policy_optimizer_runs_patch_merge_extract_loop(monkey
 
 
 @pytest.mark.asyncio
+async def test_patch_merge_policy_optimizer_thinking_defaults_to_config_passthrough(
+    monkeypatch,
+):
+    """The optimizer must not force per-call thinking for experiences/trajectories.
+
+    Regression test for issue #6096: an operator-configured ``thinking=False`` VLM
+    still received ``thinking=True`` on every patch-merge call.
+    """
+    from openviking.session.memory.dataclass import ResolvedOperations
+
+    captured = {}
+
+    class FakeExtractLoop:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def run(self):
+            return ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[]), []
+
+    monkeypatch.setattr(
+        "openviking.session.train.components.policy_optimizer.ExtractLoop",
+        FakeExtractLoop,
+    )
+
+    policy_set = _experience_set()
+    gradient = _patch_gradient(
+        uri=policy_set.policies[0].uri,
+        before="stale content",
+        after="merged content",
+    )
+    await PatchMergePolicyOptimizer(viking_fs=FakeVikingFS({}), vlm=object()).plan(
+        [gradient],
+        policy_set,
+        PatchMergePolicyOptimizerContext(request_context=fake_request_context()),
+    )
+
+    assert captured["thinking"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thinking", [True, False])
+async def test_patch_merge_policy_optimizer_explicit_thinking_is_forwarded(monkeypatch, thinking):
+    from openviking.session.memory.dataclass import ResolvedOperations
+
+    captured = {}
+
+    class FakeExtractLoop:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def run(self):
+            return ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[]), []
+
+    monkeypatch.setattr(
+        "openviking.session.train.components.policy_optimizer.ExtractLoop",
+        FakeExtractLoop,
+    )
+
+    policy_set = _experience_set()
+    gradient = _patch_gradient(
+        uri=policy_set.policies[0].uri,
+        before="stale content",
+        after="merged content",
+    )
+    optimizer = PatchMergePolicyOptimizer(
+        viking_fs=FakeVikingFS({}),
+        vlm=object(),
+        thinking=thinking,
+    )
+    await optimizer.plan(
+        [gradient],
+        policy_set,
+        PatchMergePolicyOptimizerContext(request_context=fake_request_context()),
+    )
+
+    assert captured["thinking"] is thinking
+
+
+@pytest.mark.asyncio
 async def test_patch_merge_policy_optimizer_merges_all_patch_gradients_once(monkeypatch):
     from openviking.session.memory.dataclass import (
         ResolvedOperation,
@@ -941,7 +1022,10 @@ async def test_patch_merge_policy_optimizer_keeps_distinct_output_source_links_s
 
 
 @pytest.mark.asyncio
-async def test_patch_merge_policy_optimizer_single_canonical_output_inherits_all_source_links(monkeypatch):
+@pytest.mark.parametrize("supersedes", [None, "", "older_pattern"])
+async def test_patch_merge_policy_optimizer_single_canonical_output_inherits_all_source_links(
+    monkeypatch, supersedes
+):
     from openviking.session.memory.dataclass import (
         ResolvedOperation,
         ResolvedOperations,
@@ -949,6 +1033,18 @@ async def test_patch_merge_policy_optimizer_single_canonical_output_inherits_all
 
     policy_set = ExperienceSet(root_uri="viking://user/u/memories/experiences", policies=[])
     root = policy_set.root_uri
+    old_uri = f"{root}/older_pattern.md"
+    old_history = "viking://user/u/memories/trajectories/older.md"
+    policy_set.policies.append(
+        Experience(
+            name="older_pattern",
+            uri=old_uri,
+            version=1,
+            content="old insight",
+            status="production",
+            links=[StoredLink(from_uri=old_uri, to_uri=old_history, link_type="derived_from")],
+        )
+    )
     gradients = [
         _patch_gradient(
             name="重复预订处理",
@@ -982,6 +1078,9 @@ async def test_patch_merge_policy_optimizer_single_canonical_output_inherits_all
         ),
     ]
 
+    if supersedes is not None:
+        gradients[0].after_file.extra_fields["supersedes"] = supersedes
+
     class FakeExtractLoop:
         def __init__(self, **kwargs):
             pass
@@ -1006,7 +1105,9 @@ async def test_patch_merge_policy_optimizer_single_canonical_output_inherits_all
                 [],
             )
 
-    monkeypatch.setattr("openviking.session.train.components.policy_optimizer.ExtractLoop", FakeExtractLoop)
+    monkeypatch.setattr(
+        "openviking.session.train.components.policy_optimizer.ExtractLoop", FakeExtractLoop
+    )
 
     plan = await PatchMergePolicyOptimizer(viking_fs=FakeVikingFS({}), vlm=object()).plan(
         gradients,
@@ -1014,11 +1115,14 @@ async def test_patch_merge_policy_optimizer_single_canonical_output_inherits_all
         PatchMergePolicyOptimizerContext(request_context=fake_request_context()),
     )
 
-    assert len(plan.items) == 1
-    assert {link.to_uri for link in plan.items[0].links} == {
+    upserts = [item for item in plan.items if item.kind == "upsert"]
+    deletes = [item for item in plan.items if item.kind == "delete"]
+    assert [item.target_uri for item in deletes] == ([old_uri] if supersedes else [])
+    assert len(upserts) == 1
+    assert {link.to_uri for link in upserts[0].links} == {
         "viking://user/u/memories/trajectories/traj1.md",
         "viking://user/u/memories/trajectories/traj2.md",
-    }
+    } | ({old_history} if supersedes else set())
 
 
 @pytest.mark.asyncio
@@ -1084,14 +1188,58 @@ async def test_patch_merge_policy_optimizer_runs_llm_for_single_patch(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_patch_merge_policy_optimizer_uses_session_skill_registry(monkeypatch):
+@pytest.mark.parametrize("existing", [False, True], ids=["create", "update"])
+async def test_patch_merge_policy_optimizer_uses_session_skill_registry(monkeypatch, existing):
+    from openviking.core.skill_loader import SkillLoader
     from openviking.session.memory.dataclass import (
         ResolvedOperation,
         ResolvedOperations,
     )
+    from openviking.session.train.components.skill_policy_updater import SkillPolicyUpdater
 
     skill_uri = "viking://user/u/skills/code-review/SKILL.md"
-    policy_set = ExperienceSet(root_uri="viking://user/u/skills", policies=[])
+    old_skill = {
+        "name": "code-review",
+        "description": "Old description",
+        "content": "Old content.",
+    }
+
+    class SkillFS(FakeVikingFS):
+        async def search(self, *args, **kwargs):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(to_dict=lambda: {"memories": [], "resources": [], "skills": []})
+
+        async def read_file(self, uri, ctx=None):
+            if uri not in self.files:
+                raise FileNotFoundError(uri)
+            return self.files[uri]
+
+    fs = SkillFS({skill_uri: SkillLoader.to_skill_md(old_skill)} if existing else {})
+
+    class FakeProcessor:
+        async def process_skill(self, *, data, **kwargs):
+            await fs.write_file(skill_uri, SkillLoader.to_skill_md(data))
+            return {"root_uri": skill_uri.removesuffix("/SKILL.md")}
+
+        async def sanitize_skill_privacy(self, skill, ctx):
+            return skill
+
+    policy_set = ExperienceSet(
+        root_uri="viking://user/u/skills",
+        policies=[
+            Experience(
+                name=old_skill["name"],
+                uri=skill_uri,
+                version=1,
+                status="production",
+                content=old_skill["content"],
+                metadata={"description": old_skill["description"]},
+            )
+        ]
+        if existing
+        else [],
+    )
     gradient = PatchSemanticGradient(
         before_file=None,
         after_file=MemoryFile(
@@ -1123,6 +1271,7 @@ async def test_patch_merge_policy_optimizer_uses_session_skill_registry(monkeypa
                             old_memory_file_content=None,
                             memory_fields={
                                 "skill_name": "code-review",
+                                "description": "Review code changes",
                                 "content": "Merged skill content.",
                             },
                             memory_type=SESSION_SKILL_MEMORY_TYPE,
@@ -1141,7 +1290,7 @@ async def test_patch_merge_policy_optimizer_uses_session_skill_registry(monkeypa
     )
 
     plan = await PatchMergePolicyOptimizer(
-        viking_fs=FakeVikingFS({}),
+        viking_fs=fs,
         vlm=object(),
         memory_type=SESSION_SKILL_MEMORY_TYPE,
         memory_registry=load_skill_extract_registry(),
@@ -1157,3 +1306,85 @@ async def test_patch_merge_policy_optimizer_uses_session_skill_registry(monkeypa
     assert plan.items[0].target_name == "code-review"
     assert plan.items[0].target_uri == skill_uri
     assert plan.items[0].after_content == "Merged skill content."
+
+    result = await SkillPolicyUpdater(skill_processor=FakeProcessor(), viking_fs=fs).apply(
+        plan, policy_set, fake_request_context()
+    )
+    assert result.errors == []
+    assert result.written_uris == [skill_uri]
+    saved = SkillLoader.parse(await fs.read_file(skill_uri))
+    assert saved["description"] == "Review code changes"
+    assert saved["content"] == "Merged skill content."
+    assert result.updated_policy_set.policies[0].metadata["description"] == saved["description"]
+    if existing:
+        assert policy_set.policies[0].metadata["description"] == "Old description"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locked", [False, True], ids=["standalone", "outer-tree-lock"])
+async def test_skill_policy_creation_preserves_lock_ownership(tmp_path, monkeypatch, locked):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from openviking.core.skill_loader import SkillLoader
+    from openviking.server.identity import RequestContext, Role
+    from openviking.session.train.components.skill_policy_updater import SkillPolicyUpdater
+    from openviking.session.train.domain import PolicyPlanItem
+    from openviking.storage.viking_fs import VikingFS
+    from openviking.utils.agfs_utils import RagfsBindingConfig, create_agfs_client
+    from openviking.utils.skill_processor import SkillProcessor
+    from openviking_cli.session.user_id import UserIdentifier
+    from openviking_cli.utils.config.agfs_config import AGFSConfig
+
+    agfs = create_agfs_client(RagfsBindingConfig(agfs=AGFSConfig(path=str(tmp_path))))
+    fs = VikingFS(agfs=agfs)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role(Role.ROOT))
+    root = "viking://user/default/skills"
+    uri = f"{root}/code-review/SKILL.md"
+    processor = SkillProcessor(vikingdb=AsyncMock())
+    queue = SimpleNamespace(enqueue=AsyncMock())
+    manager = SimpleNamespace(SEMANTIC="Semantic", get_queue=lambda *args, **kwargs: queue)
+    monkeypatch.setattr("openviking.storage.queuefs.get_queue_manager", lambda: manager)
+    policy_set = ExperienceSet(root_uri=root, policies=[], viking_fs=fs, request_context=ctx)
+    updater = SkillPolicyUpdater(skill_processor=processor, viking_fs=fs)
+    plan = PolicyUpdatePlan(
+        items=[
+            PolicyPlanItem(
+                kind="upsert",
+                memory_type=SESSION_SKILL_MEMORY_TYPE,
+                target_name="code-review",
+                target_uri=uri,
+                before_content=None,
+                after_content="Review steps.",
+                metadata={"merge_memory_fields": {"description": "Review code changes"}},
+            )
+        ]
+    )
+    try:
+        async with policy_set.lock() if locked else nullcontext() as lease:
+            result = await updater.apply(plan, policy_set, ctx, transaction_handle=lease)
+            assert result.errors == []
+            assert result.written_uris == [uri]
+            assert SkillLoader.parse(await fs.read_file(uri, ctx=ctx))["content"] == "Review steps."
+            for filename in (".abstract.md", ".overview.md"):
+                assert await fs.read_file(f"{root}/code-review/{filename}", ctx=ctx)
+            if locked:
+                # The callee must not release the caller's tree lock.
+                with pytest.raises(LockAcquisitionError):
+                    await fs._async_agfs.pathlock_acquire_exact(fs._uri_to_path(uri, ctx=ctx))
+        # Queued indexing keeps its own package lease after the caller exits.
+        with pytest.raises(LockAcquisitionError):
+            await fs._async_agfs.pathlock_acquire_exact(fs._uri_to_path(uri, ctx=ctx))
+        msg = queue.enqueue.await_args.args[0]
+        worker_lease = await fs._async_agfs.pathlock_adopt(msg.lock_handoff)
+        await fs._async_agfs.pathlock_release(worker_lease)
+        lease = await fs._async_agfs.pathlock_acquire_tree(fs._uri_to_path(root, ctx=ctx))
+        await fs._async_agfs.pathlock_release(lease)
+    finally:
+        from openviking.telemetry import unregister_telemetry
+
+        if queue.enqueue.await_args:
+            msg = queue.enqueue.await_args.args[0]
+            unregister_telemetry(msg.telemetry_id)
+        agfs.close()

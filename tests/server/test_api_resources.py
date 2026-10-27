@@ -166,14 +166,12 @@ async def test_add_resource_with_wait(
     sample_markdown_file,
     upload_temp_dir,
 ):
-    resp = await client.post(
-        "/api/v1/resources",
-        json={
-            "temp_file_id": sample_markdown_file.name,
-            "reason": "test resource",
-            "wait": True,
-        },
-    )
+    payload = {
+        "temp_file_id": sample_markdown_file.name,
+        "reason": "test resource",
+        "wait": True,
+    }
+    resp = await client.post("/api/v1/resources", json={**payload, "timeout": 0.0})
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
@@ -531,23 +529,27 @@ async def test_add_skill_business_error_uses_error_envelope(
     assert body["error"]["message"] == "Skill parse error: boom"
 
 
-async def test_add_skill_missing_name_returns_invalid_argument(client: httpx.AsyncClient):
-    resp = await client.post(
-        "/api/v1/skills",
-        json={
-            "data": {
-                "description": "Skill without name",
-                "content": "# No Name Skill\nTest content.",
-            },
-        },
-    )
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [
+        (
+            {"description": "Skill without name", "content": "# No Name"},
+            "Skill must have 'name' field",
+        ),
+        ("---\nname: [broken\ndescription: invalid YAML\n---\n# Skill", "Invalid YAML frontmatter"),
+    ],
+)
+async def test_add_skill_invalid_content_returns_invalid_argument(
+    client: httpx.AsyncClient, data, message
+):
+    resp = await client.post("/api/v1/skills", json={"data": data})
 
     assert resp.status_code == 400
     body = resp.json()
     assert body["status"] == "error"
     assert "result" not in body or body["result"] is None
     assert body["error"]["code"] == "INVALID_ARGUMENT"
-    assert body["error"]["message"] == "Skill must have 'name' field"
+    assert message in body["error"]["message"]
 
 
 async def test_add_skill_empty_dict_returns_invalid_argument(client: httpx.AsyncClient):
@@ -628,13 +630,27 @@ async def test_add_resource_with_to(
     assert "custom" in body["result"]["root_uri"]
 
 
+@pytest.mark.parametrize("archive_state", ["valid", "invalid", "bad_crc", "io_error"])
 async def test_add_resource_with_resources_root_to_uses_child_uri(
     client: httpx.AsyncClient,
     upload_temp_dir,
+    monkeypatch,
+    archive_state,
 ):
     archive_path = upload_temp_dir / "tt_b.zip"
     with zipfile.ZipFile(archive_path, "w") as zf:
         zf.writestr("tt_b/bb/readme.md", "# hello\n")
+
+    if archive_state == "invalid":
+        archive_path.write_bytes(b"not a zip archive")
+    elif archive_state == "bad_crc":
+        archive_path.write_bytes(archive_path.read_bytes().replace(b"# hello", b"# wrong"))
+    elif archive_state == "io_error":
+
+        def fail_to_open(*args, **kwargs):
+            raise OSError("disk unavailable")
+
+        monkeypatch.setattr(zipfile, "ZipFile", fail_to_open)
 
     resp = await client.post(
         "/api/v1/resources",
@@ -645,6 +661,14 @@ async def test_add_resource_with_resources_root_to_uses_child_uri(
             "wait": True,
         },
     )
+    if archive_state != "valid":
+        is_bad_input = archive_state != "io_error"
+        assert resp.status_code == (400 if is_bad_input else 500), resp.text
+        error = resp.json()["error"]
+        assert error["code"] == ("INVALID_ARGUMENT" if is_bad_input else "PROCESSING_ERROR")
+        assert ("Not a valid ZIP file" if is_bad_input else "disk unavailable") in error["message"]
+        return
+
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
@@ -812,7 +836,7 @@ async def test_add_resource_non_wait_auto_name_resolves_unique_root_uri(
 async def test_wait_processed_empty_queue(client: httpx.AsyncClient):
     resp = await client.post(
         "/api/v1/system/wait",
-        json={"timeout": 30.0},
+        json={},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -830,7 +854,7 @@ async def test_wait_processed_after_add(
     )
     resp = await client.post(
         "/api/v1/system/wait",
-        json={"timeout": 60.0},
+        json={},
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"

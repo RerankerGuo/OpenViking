@@ -1,19 +1,33 @@
-import { useEffect, useMemo, useRef, useState, lazy, Suspense } from 'react'
+import { formatDateTime } from '#/i18n/format'
+import i18n from '#/i18n/core'
+import {
+  createContext,
+  isValidElement,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  lazy,
+  Suspense,
+} from 'react'
 import type { ComponentProps, ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import hljs from 'highlight.js/lib/core'
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import rehypeRaw from 'rehype-raw'
-import rehypeSanitize from 'rehype-sanitize'
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import remarkBreaks from 'remark-breaks'
 import remarkGfm from 'remark-gfm'
 import { X, Pencil, Save, XCircle, Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
 
 import { Button } from '#/components/ui/button'
 import { ScrollArea } from '#/components/ui/scroll-area'
 import { client } from '#/gen/ov-client/client.gen'
 import { getContentDownload, ovClient } from '#/lib/ov-client'
+import { splitMarkdownFrontmatter } from '#/lib/markdown-frontmatter'
 import { parseOkfSidecarMarkdown } from '#/lib/okf-markdown'
 import { fileNameFromUri } from '#/lib/viking-uri'
 import type { GetContentDownloadData } from '#/gen/ov-client/types.gen'
@@ -32,11 +46,15 @@ import {
 } from '../-hooks/viking-fm'
 import { useJsonFormat } from '../-hooks/use-json-format'
 import type { VikingFsEntry } from '../-types/viking-fm'
-import type { CodeEditorHandle } from './code-editor'
+import type { CodeEditorHandle } from '#/components/code-editor'
 import { OkfMetadataPanel } from './okf-metadata-panel'
+import { YamlMetadata } from './yaml-metadata'
 
 const LazyCodeEditor = lazy(() =>
-  import('./code-editor').then((m) => ({ default: m.CodeEditor })),
+  import('#/components/code-editor').then((m) => ({ default: m.CodeEditor })),
+)
+const LazyMermaidDiagram = lazy(() =>
+  import('./mermaid-diagram').then((m) => ({ default: m.MermaidDiagram })),
 )
 
 const languageLoaders: Partial<
@@ -112,6 +130,8 @@ async function ensureLanguage(lang: string): Promise<void> {
 }
 
 interface FilePreviewProps {
+  readOnly?: boolean
+  defaultReadLimit?: number
   file: VikingFsEntry | null
   hideDirectoryHeader?: boolean
   onClose: () => void
@@ -120,6 +140,15 @@ interface FilePreviewProps {
 }
 
 const vikingPrefix = 'viking://'
+const markdownSanitizeSchema = {
+  ...defaultSchema,
+  protocols: {
+    ...defaultSchema.protocols,
+    src: [...(defaultSchema.protocols?.src ?? []), 'viking'],
+    href: [...(defaultSchema.protocols?.href ?? []), 'viking'],
+  },
+}
+const MarkdownLinkContext = createContext(false)
 const contentDownloadUrl: GetContentDownloadData['url'] =
   '/api/v1/content/download'
 
@@ -133,15 +162,15 @@ const DIRECTORY_LEVEL_META: Array<{
 }> = [
   {
     id: 'abstract',
-    label: 'Abstract',
+    label: 'filePreview.directoryLevels.abstractLabel',
     name: 'L0',
-    title: 'Short semantic abstract',
+    title: 'filePreview.directoryLevels.abstractDescription',
   },
   {
     id: 'overview',
-    label: 'Overview',
+    label: 'filePreview.directoryLevels.overviewLabel',
     name: 'L1',
-    title: 'Directory overview',
+    title: 'filePreview.directoryLevels.overviewDescription',
   },
 ]
 
@@ -228,7 +257,9 @@ function directoryLevelPreview(
 }
 
 function useDirectoryPreview(file: VikingFsEntry | null) {
-  const enabled = Boolean(file?.isDir)
+  const enabled = Boolean(
+    file?.isDir && normalizeDirUri(file.uri) !== 'viking://',
+  )
   const abstractQuery = useQuery({
     enabled,
     queryKey: ['viking-directory-sidecar', file?.uri, 'abstract'],
@@ -294,6 +325,7 @@ function dirnameVikingUri(fileUri: string): string {
   return `${trimmed.slice(0, idx + 1)}`
 }
 
+/** Resolve a decoded file path without interpreting literal # or percent signs. */
 function resolveRelativeVikingUri(
   baseFileUri: string,
   rawPath: string,
@@ -301,11 +333,8 @@ function resolveRelativeVikingUri(
   const baseDir = dirnameVikingUri(baseFileUri)
   const baseBody = baseDir.slice(vikingPrefix.length, -1)
 
-  const pathPart = rawPath.split('#')[0]?.split('?')[0] || ''
-  const suffix = rawPath.slice(pathPart.length)
-
   const baseSegments = baseBody ? baseBody.split('/').filter(Boolean) : []
-  const relativeSegments = pathPart.split('/').filter(Boolean)
+  const relativeSegments = rawPath.split('/').filter(Boolean)
 
   const merged = [...baseSegments]
   for (const segment of relativeSegments) {
@@ -320,7 +349,7 @@ function resolveRelativeVikingUri(
   }
 
   const resolved = `${vikingPrefix}${merged.join('/')}`
-  return `${resolved}${suffix}`
+  return resolved
 }
 
 type MarkdownAssetTarget =
@@ -349,11 +378,8 @@ function resolveMarkdownAssetTarget(
     return { kind: 'external', value: trimmed }
   }
 
-  // react-markdown percent-encodes the URL it passes via `src`/`href`
-  // (e.g. Chinese characters become %E4%BA%92). Decode it back to the literal
-  // form so the API client's query serializer encodes it exactly once and we
-  // avoid a double-encoded URI that the backend rejects with HTTP 400.
-  const decoded = safeDecodeUri(trimmed)
+  // Split URL components before decoding; %23 is literal filename data.
+  const decoded = safeDecodeUri(trimmed.split(/[?#]/, 1)[0])
 
   const vikingUri = decoded.startsWith(vikingPrefix)
     ? decoded
@@ -361,8 +387,7 @@ function resolveMarkdownAssetTarget(
   return { kind: 'viking', value: vikingUri }
 }
 
-function resolveMarkdownAssetUrl(assetPath: string, fileUri: string): string {
-  const target = resolveMarkdownAssetTarget(assetPath, fileUri)
+function resolveMarkdownAssetUrl(target: MarkdownAssetTarget): string {
   if (target.kind === 'viking') {
     return toDownloadUrl(target.value)
   }
@@ -389,7 +414,7 @@ function MarkdownLink({
   const resolvedHref = target
     ? isInternal
       ? target.value
-      : resolveMarkdownAssetUrl(target.value, fileUri)
+      : resolveMarkdownAssetUrl(target)
     : ''
   const isExternal = /^(https?:|mailto:|tel:)/i.test(resolvedHref)
 
@@ -405,7 +430,9 @@ function MarkdownLink({
       target={isExternal ? '_blank' : undefined}
       rel={isExternal ? 'noreferrer noopener' : undefined}
     >
-      {children}
+      <MarkdownLinkContext.Provider value={true}>
+        {children}
+      </MarkdownLinkContext.Provider>
     </a>
   )
 }
@@ -427,7 +454,7 @@ function DirectoryMarkdownLink({
   }
 
   return (
-    <MarkdownLink href={decodedHref} fileUri={fileUri} onNavigate={onNavigate}>
+    <MarkdownLink href={href} fileUri={fileUri} onNavigate={onNavigate}>
       {children}
     </MarkdownLink>
   )
@@ -437,11 +464,14 @@ function MarkdownImage({
   src,
   alt,
   fileUri,
+  onNavigate,
 }: {
   src?: string
   alt?: string
   fileUri: string
+  onNavigate?: (uri: string) => void
 }) {
+  const insideLink = useContext(MarkdownLinkContext)
   const target = useMemo(
     () => (src ? resolveMarkdownAssetTarget(String(src), fileUri) : null),
     [src, fileUri],
@@ -469,7 +499,7 @@ function MarkdownImage({
         if (!alive) return
         const blob = response.data as Blob
         if (blob.size === 0) {
-          throw new Error('empty blob')
+          throw new Error(i18n.t('studio:errors.emptyBlob'))
         }
         created = URL.createObjectURL(blob)
         setObjectUrl(created)
@@ -504,15 +534,29 @@ function MarkdownImage({
     }
     return null
   }
+  if (!resolvedSrc) return null
 
-  return (
+  const image = (
     <img
       src={resolvedSrc}
-      alt={alt || ''}
+      alt={
+        alt ||
+        (target?.kind === 'viking' && onNavigate && !insideLink
+          ? fileNameFromUri(target.value)
+          : '')
+      }
       loading="lazy"
       className="max-w-full rounded-md outline outline-1 -outline-offset-1 outline-black/10 dark:outline-white/10"
     />
   )
+  if (target?.kind === 'viking' && onNavigate && !insideLink) {
+    return (
+      <MarkdownLink href={src} fileUri={fileUri} onNavigate={onNavigate}>
+        {image}
+      </MarkdownLink>
+    )
+  }
+  return image
 }
 
 function detectCodeLanguage(filename: string): string | null {
@@ -724,6 +768,26 @@ function MarkdownCode({
 }
 
 function MarkdownPre({ children }: ComponentProps<'pre'>) {
+  const child =
+    Array.isArray(children) && children.length === 1 ? children[0] : children
+  if (
+    isValidElement<{ className?: string; children?: ReactNode }>(child) &&
+    normalizeMarkdownLanguage(child.props.className) === 'mermaid'
+  ) {
+    const chart = textFromReactNode(child.props.children).replace(/\n$/, '')
+    return (
+      <Suspense
+        fallback={
+          <pre className="overflow-x-auto rounded-md border bg-muted/30 p-3 text-xs leading-6 text-foreground dark:bg-muted-foreground/20">
+            <code className="hljs block whitespace-pre font-mono">{chart}</code>
+          </pre>
+        }
+      >
+        <LazyMermaidDiagram chart={chart} />
+      </Suspense>
+    )
+  }
+
   return (
     <pre className="overflow-x-auto rounded-md border bg-muted/30 p-3 text-xs leading-6 text-foreground dark:bg-muted-foreground/20">
       {children}
@@ -976,7 +1040,7 @@ function formatJsonlTime(value: string): string {
   if (!value) return ''
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
-  return date.toLocaleString([], {
+  return formatDateTime(date, {
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
@@ -1319,6 +1383,8 @@ function JsonlPreview({ content }: { content: string }) {
 }
 
 export function FilePreview({
+  readOnly = false,
+  defaultReadLimit,
   file,
   hideDirectoryHeader = false,
   onClose,
@@ -1347,7 +1413,7 @@ export function FilePreview({
     resolvedFile,
     {
       maxAutoReadBytes: LARGE_FILE_PREVIEW_BYTES,
-      defaultReadLimit: -1,
+      defaultReadLimit: defaultReadLimit ?? (readOnly ? 10000 : -1),
       requireKnownSize: isJsonFile,
     },
     {
@@ -1362,6 +1428,10 @@ export function FilePreview({
   const displayContent = useMemo(
     () => memoryFieldsDisplayContent(preview?.content || ''),
     [preview?.content],
+  )
+  const frontmatter = useMemo(
+    () => splitMarkdownFrontmatter(displayContent || ''),
+    [displayContent],
   )
   const okfDocument = useMemo(
     () =>
@@ -1384,10 +1454,15 @@ export function FilePreview({
   >(new Set(['abstract', 'overview']))
   const [editing, setEditing] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [loadingEditor, setLoadingEditor] = useState(false)
+  const [editorContent, setEditorContent] = useState('')
+  const fileUriRef = useRef(file?.uri)
+  fileUriRef.current = file?.uri
   const editorRef = useRef<CodeEditorHandle>(null)
   const { invalidatePreview } = useInvalidateVikingFs()
 
   const canEdit =
+    !readOnly &&
     !file?.isDir &&
     preview?.shouldAutoRead &&
     (preview.fileType === 'code' ||
@@ -1399,6 +1474,8 @@ export function FilePreview({
     setMarkdownMode('preview')
     setJsonMode('preview')
     setEditing(false)
+    setLoadingEditor(false)
+    setEditorContent('')
     setActiveDirectoryLevels(new Set(['abstract', 'overview']))
   }, [file?.uri])
 
@@ -1484,7 +1561,7 @@ export function FilePreview({
 
         const blob = response.data as Blob
         if (blob.size === 0) {
-          throw new Error('empty blob')
+          throw new Error(i18n.t('studio:errors.emptyBlob'))
         }
 
         const nextUrl = URL.createObjectURL(blob)
@@ -1513,6 +1590,38 @@ export function FilePreview({
     }
   }, [file, preview?.fileType])
 
+  const handleEdit = async () => {
+    if (!file || loadingEditor || !canEdit) return
+    const uri = file.uri
+    setLoadingEditor(true)
+    try {
+      // A limited preview must never become a replace write. Download the
+      // complete original content through the authenticated API first.
+      const response = preview.truncated
+        ? await getContentDownload({
+            query: { uri },
+            responseType: 'text',
+            throwOnError: true,
+          })
+        : null
+      if (fileUriRef.current !== uri) return
+      const content = response ? response.data : preview.content
+      if (
+        typeof content !== 'string' ||
+        new Blob([content]).size > LARGE_FILE_PREVIEW_BYTES
+      ) {
+        throw new Error(t('filePreview.largeFileSkipped'))
+      }
+      setEditorContent(content)
+      setEditing(true)
+    } catch (err) {
+      if (fileUriRef.current === uri)
+        toast.error(t('filePreview.editFailed'), { description: String(err) })
+    } finally {
+      if (fileUriRef.current === uri) setLoadingEditor(false)
+    }
+  }
+
   const handleSave = async () => {
     if (!file || !editorRef.current) return
     setSaving(true)
@@ -1521,7 +1630,7 @@ export function FilePreview({
       invalidatePreview(file.uri)
       setEditing(false)
     } catch (err) {
-      console.error('Save failed:', err)
+      toast.error(t('filePreview.saveFailed'), { description: String(err) })
     } finally {
       setSaving(false)
     }
@@ -1546,6 +1655,14 @@ export function FilePreview({
   )
   const showHeader = !(hideDirectoryHeader && file.isDir)
   const previewFile = resolvedFile || file
+  const sizeLabel = formatSize(previewFile.sizeBytes ?? previewFile.size, {
+    fallback: '',
+  })
+  const modTimeLabel =
+    previewFile.modTime && previewFile.modTime !== '-'
+      ? previewFile.modTime
+      : ''
+  const fileMetadata = [sizeLabel, modTimeLabel].filter(Boolean).join(' · ')
   const showJsonPreview =
     !editing &&
     !previewLoading &&
@@ -1562,12 +1679,6 @@ export function FilePreview({
               <div className="truncate text-sm font-medium leading-5">
                 {file.name}
               </div>
-              {!file.isDir ? (
-                <div className="text-xs leading-5 text-muted-foreground">
-                  {formatSize(previewFile.sizeBytes ?? previewFile.size)} ·{' '}
-                  {previewFile.modTime || '-'}
-                </div>
-              ) : null}
             </div>
             {editing ? (
               <div className="flex items-center gap-1">
@@ -1599,7 +1710,8 @@ export function FilePreview({
                 <Button
                   size="sm"
                   variant="ghost"
-                  onClick={() => setEditing(true)}
+                  disabled={loadingEditor}
+                  onClick={() => void handleEdit()}
                 >
                   <Pencil className="mr-1 size-3.5" />
                   {t('filePreview.edit')}
@@ -1632,7 +1744,7 @@ export function FilePreview({
           >
             <LazyCodeEditor
               ref={editorRef}
-              initialContent={preview.content}
+              initialContent={editorContent}
               filename={file.name}
               isDark={isDark}
             />
@@ -1747,7 +1859,7 @@ export function FilePreview({
                               ? 'border-border bg-muted text-foreground'
                               : 'border-border bg-background text-muted-foreground hover:border-foreground/30 hover:text-foreground'
                           }`}
-                          title={level.title}
+                          title={t(level.title)}
                           onClick={() =>
                             setActiveDirectoryLevels((current) => {
                               const next = new Set(current)
@@ -1763,7 +1875,7 @@ export function FilePreview({
                           <span className="font-mono text-[10px] font-semibold uppercase tracking-wide text-primary">
                             {level.name}
                           </span>
-                          <span className="font-medium">{level.label}</span>
+                          <span className="font-medium">{t(level.label)}</span>
                         </button>
                       )
                     })}
@@ -1792,9 +1904,9 @@ export function FilePreview({
                           <span className="font-mono font-semibold uppercase tracking-wide text-primary">
                             {level.name}
                           </span>
-                          <span className="font-medium">{level.label}</span>
+                          <span className="font-medium">{t(level.label)}</span>
                           <span className="text-muted-foreground">
-                            {level.title}
+                            {t(level.title)}
                           </span>
                         </header>
                         {level.document ? (
@@ -1850,7 +1962,9 @@ export function FilePreview({
                     src={imageSrc}
                     alt={file.name}
                     className="max-h-[70vh] max-w-full rounded-md object-contain outline outline-1 -outline-offset-1 outline-black/10 dark:outline-white/10"
-                    onError={() => setImageError('direct img failed')}
+                    onError={() =>
+                      setImageError(t('studio:errors.imageLoadFailed'))
+                    }
                   />
                   {imageError ? (
                     <div className="text-xs text-muted-foreground">
@@ -1912,12 +2026,20 @@ export function FilePreview({
                     onNavigate={onNavigate}
                     rawFrontmatter={okfDocument.rawFrontmatter}
                   />
+                ) : frontmatter ? (
+                  <YamlMetadata
+                    rawFrontmatter={frontmatter.rawFrontmatter}
+                    defaultOpen
+                  />
                 ) : null}
                 <article className="prose prose-sm max-w-none break-words dark:prose-invert dark:prose-pre:bg-muted-foreground/20">
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
-                    rehypePlugins={[rehypeRaw, rehypeSanitize]}
-                    urlTransform={(url) => url}
+                    rehypePlugins={[
+                      rehypeRaw,
+                      [rehypeSanitize, markdownSanitizeSchema],
+                    ]}
+                    urlTransform={transformDirectoryMarkdownUrl}
                     components={{
                       ...markdownComponents,
                       img: ({ src, alt }) => (
@@ -1925,6 +2047,7 @@ export function FilePreview({
                           src={src ? String(src) : undefined}
                           alt={alt}
                           fileUri={file.uri}
+                          onNavigate={onNavigate}
                         />
                       ),
                       a: ({ href, children }) => (
@@ -1940,7 +2063,7 @@ export function FilePreview({
                   >
                     {okfDocument
                       ? okfDocument.body || emptyFileText
-                      : displayContent || emptyFileText}
+                      : (frontmatter?.body ?? displayContent) || emptyFileText}
                   </ReactMarkdown>
                 </article>
               </div>
@@ -1998,6 +2121,11 @@ export function FilePreview({
           </div>
         </ScrollArea>
       )}
+      {!file.isDir && fileMetadata ? (
+        <footer className="shrink-0 border-t px-4 py-2 text-xs text-muted-foreground">
+          {fileMetadata}
+        </footer>
+      ) : null}
     </div>
   )
 }

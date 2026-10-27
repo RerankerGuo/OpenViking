@@ -3,16 +3,124 @@
 """Regression tests for Git preflight process cleanup."""
 
 import asyncio
+import base64
 import os
 import signal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
+from openviking.parse.mode import ParseMode
+from openviking.parse.network import (
+    ParserNetworkOperation,
+    register_parser_network_adapter,
+    reset_parser_network_adapter,
+)
+from openviking.server.identity import RequestContext, Role
+from openviking.service import resource_service as resource_service_module
 from openviking.service.resource_service import ResourceService
 from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.session.user_id import UserIdentifier
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
+
+
+async def test_account_token_and_parser_proxy_reach_repository_preflight(monkeypatch):
+    token_resolver = AsyncMock(return_value="account-token")
+    processor = SimpleNamespace(github_token_for=token_resolver)
+    service = ResourceService(resource_processor=processor)
+    process = Mock(returncode=0)
+    process.communicate = AsyncMock(return_value=(b"refs/heads/main\n", b""))
+    execute = AsyncMock(return_value=process)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", execute)
+    monkeypatch.setattr(
+        resource_service_module, "parse_code_hosting_url", lambda _source: "org/private"
+    )
+    monkeypatch.setattr(resource_service_module, "is_git_repo_url", lambda _path: True)
+    monkeypatch.setattr(resource_service_module, "is_github_url", lambda _path: True)
+    ctx = RequestContext(
+        user=UserIdentifier("account-1", "user-1"),
+        role=Role.USER,
+    )
+
+    register_parser_network_adapter(
+        SimpleNamespace(
+            supports=lambda context: context.operation is ParserNetworkOperation.GIT_COMMAND,
+            subprocess_env_overlay=lambda context: {"HTTPS_PROXY": "http://proxy.example:8118"},
+        )
+    )
+    try:
+        plan = await service._prepare_standard_source_plan(
+            path="https://github.com/org/private",
+            ctx=ctx,
+            mode=ParseMode.DEFAULT,
+            allow_local_path_resolution=False,
+            processor_kwargs={},
+            watch_auth_state=None,
+        )
+    finally:
+        reset_parser_network_adapter()
+
+    token_resolver.assert_awaited_once_with("https://github.com/org/private", ctx)
+    assert execute.await_args.args == (
+        "git",
+        "ls-remote",
+        "--heads",
+        "https://github.com/org/private",
+    )
+    env = execute.await_args.kwargs["env"]
+    assert env["HTTPS_PROXY"] == "http://proxy.example:8118"
+    entries = {
+        env[f"GIT_CONFIG_KEY_{index}"]: env[f"GIT_CONFIG_VALUE_{index}"]
+        for index in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    encoded = base64.b64encode(b"oauth2:account-token").decode("ascii")
+    assert entries["http.https://github.com/org/private.extraHeader"] == (
+        f"Authorization: Basic {encoded}"
+    )
+    assert plan is not None
+    assert plan.task_auth == {}
+    assert "account-token" not in str(plan.processor_args)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "git@github.com:org/private.git",
+        "ssh://git@github.com/org/private.git",
+    ],
+)
+async def test_default_github_token_is_not_applied_to_ssh_preflight(monkeypatch, source):
+    token_resolver = AsyncMock(return_value="account-token")
+    processor = SimpleNamespace(github_token_for=token_resolver)
+    service = ResourceService(resource_processor=processor)
+    service._preflight_git_source = AsyncMock(
+        return_value=SimpleNamespace(
+            source_name="private",
+            source_path=source,
+            source_format="repository",
+        )
+    )
+    monkeypatch.setattr(resource_service_module, "is_git_repo_url", lambda _path: True)
+    monkeypatch.setattr(resource_service_module, "is_github_url", lambda _path: True)
+    ctx = RequestContext(
+        user=UserIdentifier("account-1", "user-1"),
+        role=Role.USER,
+    )
+
+    plan = await service._prepare_standard_source_plan(
+        path=source,
+        ctx=ctx,
+        mode=ParseMode.DEFAULT,
+        allow_local_path_resolution=False,
+        processor_kwargs={},
+        watch_auth_state=None,
+    )
+
+    token_resolver.assert_not_awaited()
+    service._preflight_git_source.assert_awaited_once_with(source, auth_config=None)
+    assert plan is not None
 
 
 async def test_git_preflight_timeout_kills_process_group_and_bounds_reap(monkeypatch):

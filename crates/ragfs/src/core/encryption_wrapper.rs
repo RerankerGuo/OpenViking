@@ -26,7 +26,9 @@ use super::errors::{Error, Result};
 use super::filesystem::{
     apply_read_dir_options, compile_grep_regex, normalize_prefix_path, paginate_entries, FileSystem,
 };
-use super::types::{FileInfo, GlobPage, GrepResult, ListSortBy, SortOrder, TreeEntry, WriteFlag};
+use super::types::{
+    FileInfo, GlobPage, GrepOptions, GrepResult, ListSortBy, SortOrder, TreeEntry, WriteFlag,
+};
 
 const SYSTEM_ACCOUNT_ID: &str = "_system";
 const TEMP_ROOT_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -373,7 +375,7 @@ impl FileSystem for EncryptionWrappedFS {
             self.create_temp_root(&temp_root).await?;
         }
 
-        // Acquire dual-path exact lock for the temp publish path and the final visible path.
+        // Acquire dual-path exact lock only when no outer PathLock already covers the final path.
         let final_lock_path = self.backend_lock_path(path);
         let temp_lock_path = self.backend_lock_path(&temp_path);
         let final_request = PathLockRequest {
@@ -399,28 +401,14 @@ impl FileSystem for EncryptionWrappedFS {
             AutoPathLockAction::Covered(_) => "covered",
             AutoPathLockAction::Acquire => "acquire",
         };
-        debug!(path = %path, temp_path = %temp_path, final_lock_path = %requests[1].path, temp_lock_path = %requests[0].path, action = %action_name, "encrypted write resolved dual-path pathlock action");
+        debug!(path = %path, temp_path = %temp_path, final_lock_path = %requests[1].path, temp_lock_path = %requests[0].path, action = %action_name, "encrypted write resolved pathlock action");
         let lock_guard = match action {
             AutoPathLockAction::Disabled => None,
-            AutoPathLockAction::Covered(outer) => {
-                let owner_capability =
-                    (outer.lease.lease_ref.as_str(), outer.ownership_ref.as_str());
-                Some(
-                    self.pathlock_manager
-                        .acquire_batch(&requests, Duration::from_secs(1), Some(owner_capability))
-                        .await
-                        .map_err(|error| {
-                            Error::internal(format!("encrypted write lock error: {error}"))
-                        })?,
-                )
-            }
+            AutoPathLockAction::Covered(_) => None,
             AutoPathLockAction::Acquire => Some(
                 self.pathlock_manager
                     .acquire_batch(&requests, Duration::from_secs(1), None)
-                    .await
-                    .map_err(|error| {
-                        Error::internal(format!("encrypted write lock error: {error}"))
-                    })?,
+                    .await?,
             ),
         };
 
@@ -450,45 +438,25 @@ impl FileSystem for EncryptionWrappedFS {
         &self,
         path: &str,
         pattern: &str,
-        recursive: bool,
-        case_insensitive: bool,
-        node_limit: Option<usize>,
-        exclude_path: Option<&str>,
-        level_limit: Option<usize>,
+        options: GrepOptions<'_>,
     ) -> Result<GrepResult> {
         if Self::should_passthrough_content(path) {
-            return self
-                .inner
-                .grep(
-                    path,
-                    pattern,
-                    recursive,
-                    case_insensitive,
-                    node_limit,
-                    exclude_path,
-                    level_limit,
-                )
-                .await;
+            return self.inner.grep(path, pattern, options).await;
         }
 
         // This layer only exists when encryption is on, so always traverse via the trait default
         // grep_internal -> grep_file -> self.read (which decrypts). Never delegate to inner.grep:
         // the plugin override would run the regex against raw ciphertext and miss every file.
-        let re = compile_grep_regex(pattern, case_insensitive)?;
+        let re = compile_grep_regex(pattern, options.case_insensitive)?;
         let base = normalize_prefix_path(path);
-        let excl = exclude_path.map(normalize_prefix_path);
+        let excl = options.exclude_path.map(normalize_prefix_path);
+        let options = GrepOptions {
+            exclude_path: excl.as_deref(),
+            ..options
+        };
         let mut result = GrepResult::new();
-        self.grep_internal(
-            &base,
-            &base,
-            &re,
-            recursive,
-            node_limit,
-            excl.as_deref(),
-            level_limit,
-            &mut result,
-        )
-        .await?;
+        self.grep_internal(&base, &base, &re, options, &mut result)
+            .await?;
         Ok(result)
     }
 
@@ -559,6 +527,7 @@ impl FileSystem for EncryptionWrappedFS {
         offset: Option<usize>,
         sort_by: Option<ListSortBy>,
         sort_order: Option<SortOrder>,
+        directories_only: bool,
     ) -> Result<Vec<TreeEntry>> {
         // Metadata only — no content read, so delegate to preserve plugin-native tree optimizations.
         let entries = self
@@ -571,6 +540,7 @@ impl FileSystem for EncryptionWrappedFS {
                 None,
                 sort_by,
                 sort_order,
+                directories_only,
             )
             .await?;
         let entries = entries
@@ -776,7 +746,14 @@ mod tests {
                 .await
                 .unwrap();
                 let res = enc
-                    .grep("/mem", "NEEDLE", true, false, None, None, None)
+                    .grep(
+                        "/mem",
+                        "NEEDLE",
+                        GrepOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
                     .await
                     .unwrap();
                 assert_eq!(res.count, 1);

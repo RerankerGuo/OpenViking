@@ -13,7 +13,8 @@ from openviking_cli.utils.uri import VikingURI
 
 _CONTENT_TYPES_BY_SCOPE = {
     "user": {"memories": "memory", "resources": "resource", "skills": "skill"},
-    "agent": {"memories": "memory", "resources": "resource", "skills": "skill"},
+    "agent": {"skills": "skill"},
+    "system": {"example-skills": "skill"},
 }
 _PEER_CONTENT_SEGMENTS = frozenset({"memories", "resources"})
 _USER_RELATIVE_ROOT_SEGMENTS = frozenset({"peers", "privacy", "sessions"})
@@ -52,12 +53,12 @@ class UriClassification:
         return self.context_type == "skill"
 
     @property
-    def is_user_namespace_root(self) -> bool:
-        return _is_namespace_root_parts(self.parts, "user")
+    def is_system(self) -> bool:
+        return self.scope == "system"
 
     @property
-    def is_agent_namespace_root(self) -> bool:
-        return self.scope == "agent" and len(self.parts) == 2
+    def is_user_namespace_root(self) -> bool:
+        return _is_namespace_root_parts(self.parts, "user")
 
     @property
     def is_memory_root(self) -> bool:
@@ -119,7 +120,7 @@ def _content_segment_index(parts: tuple[str, ...]) -> Optional[int]:
     """Return the content segment for a supported namespace shape."""
     if len(parts) >= 2 and parts[:2] == ("agent", "skills"):
         return 1
-    if len(parts) >= 3 and parts[0] == "agent" and parts[2] in _CONTENT_TYPES_BY_SCOPE["agent"]:
+    if len(parts) >= 3 and parts[:3] == ("system", "compile", "example-skills"):
         return 2
     if len(parts) < 2 or parts[0] != "user":
         return None
@@ -175,18 +176,16 @@ def canonical_session_uri(ctx: RequestContext, session_id: Optional[str] = None)
 
 def is_session_uri(uri: str) -> bool:
     parts = uri_parts(uri)
-    if parts[:1] == ["session"]:
-        return True
     return len(parts) >= 3 and parts[0] == "user" and parts[2] == "sessions"
 
 
-AGENT_SHARED_ROOTS: tuple[str, ...] = ("viking://agent/skills",)
+AGENT_SKILLS_ROOT = "viking://agent/skills"
 
 
 def visible_roots(ctx: RequestContext) -> list[str]:
     return [
         "viking://resources",
-        *AGENT_SHARED_ROOTS,
+        "viking://agent",
         canonical_user_root(ctx),
     ]
 
@@ -257,14 +256,14 @@ def resolve_uri(
 def resolve_request_uri(uri: str, ctx: RequestContext) -> str:
     """Resolve supported URI aliases at an authenticated request boundary.
 
-    Supported aliases are the ``~`` home alias and the legacy ``session`` scope.
+    The ``~`` home alias resolves to the authenticated user's namespace.
     The uid-less ``viking://user/<reserved>`` shorthand is no longer expanded:
     it fails closed with a hint pointing at ``viking://~/...``.
     """
     # Every authenticated request context carries an effective user identity,
     # including ROOT contexts produced by dev, API-key, and trusted auth modes.
-    # Resolve only the unambiguous home alias for every role; preserve the
-    # existing role-dependent handling of legacy/ambiguous spellings below.
+    # Resolve the home alias for every role; keep the role-dependent handling
+    # of ambiguous uid-less user paths below.
     parts = uri_parts(uri)
     if parts and parts[0] == "~":
         return resolve_current_user_uri(uri, ctx)
@@ -276,8 +275,7 @@ def resolve_request_uri(uri: str, ctx: RequestContext) -> str:
 def resolve_current_user_uri(uri: str, ctx: RequestContext) -> str:
     """Resolve a URI field whose contract explicitly denotes the current user.
 
-    Supported aliases are ``viking://~`` (the home alias) and the legacy
-    ``viking://session/...`` scope. ``viking://user/<reserved-segment>`` used to
+    The supported alias is ``viking://~``. ``viking://user/<reserved-segment>`` used to
     expand to the caller's space; it now fails closed with a corrective hint,
     because the same spelling is a valid explicit-uid URI for a user literally
     named after the reserved segment.
@@ -290,14 +288,6 @@ def resolve_current_user_uri(uri: str, ctx: RequestContext) -> str:
         if len(parts) == 1:
             return canonical_user_root(ctx)
         return f"{canonical_user_root(ctx)}/{'/'.join(parts[1:])}"
-
-    if parts[0] == "session":
-        if len(parts) == 1:
-            return canonical_session_root(ctx)
-        canonical = canonical_session_uri(ctx, parts[1])
-        if len(parts) > 2:
-            canonical = f"{canonical}/{'/'.join(parts[2:])}"
-        return canonical
 
     if (
         parts[0] == "user"
@@ -329,17 +319,12 @@ def is_accessible(uri: str, ctx: RequestContext) -> bool:
     except NamespaceShapeError:
         return False
 
-    if target.scope in {"", "resources", "temp", "queue"}:
+    if target.scope in {"", "resources", "agent", "temp", "queue"}:
         return True
     if target.scope == "upload":
         return False
     if target.scope == "user":
         if target.owner_user_id and target.owner_user_id != ctx.user.user_id:
-            return False
-        return True
-    if target.scope == "agent":
-        parts = uri_parts(target.uri)
-        if ctx.actor_peer_id and len(parts) >= 2 and parts[1] != ctx.actor_peer_id:
             return False
         return True
     return True

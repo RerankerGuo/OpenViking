@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { ChevronRight, FolderIcon, FolderOpen } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '#/components/ui/button'
@@ -29,6 +30,9 @@ function getErrorMessage(error: unknown): string {
 }
 
 interface DirectoryPickerDialogProps {
+  emptyAction?: ReactNode
+  userResourceRoot?: string
+  identityScopeKey?: string
   open: boolean
   onOpenChange: (open: boolean) => void
   value: string
@@ -53,6 +57,9 @@ function parseBreadcrumbs(uri: string): Array<{ label: string; uri: string }> {
 }
 
 export function DirectoryPickerDialog({
+  emptyAction,
+  identityScopeKey = 'default',
+  userResourceRoot,
   open,
   onOpenChange,
   value,
@@ -70,7 +77,7 @@ export function DirectoryPickerDialog({
   const normalizedUri = normalizeDirUri(browseUri)
 
   const dirQuery = useQuery({
-    queryKey: ['dir-picker', normalizedUri],
+    queryKey: ['dir-picker', identityScopeKey, normalizedUri],
     queryFn: async () => {
       const result = await getOvResult<FSListResult>(
         getFsLs({
@@ -95,6 +102,42 @@ export function DirectoryPickerDialog({
           <DialogTitle>{t('dirPicker.title')}</DialogTitle>
         </DialogHeader>
 
+        {userResourceRoot && (
+          <div
+            className="flex gap-2"
+            role="group"
+            aria-label={t('dirPicker.scope')}
+          >
+            <Button
+              type="button"
+              size="sm"
+              variant={
+                normalizedUri.startsWith(normalizeDirUri(userResourceRoot))
+                  ? 'secondary'
+                  : 'ghost'
+              }
+              aria-pressed={normalizedUri.startsWith(
+                normalizeDirUri(userResourceRoot),
+              )}
+              onClick={() => setBrowseUri(userResourceRoot)}
+            >
+              {t('dirPicker.mine')}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={
+                normalizedUri.startsWith('viking://resources/')
+                  ? 'secondary'
+                  : 'ghost'
+              }
+              aria-pressed={normalizedUri.startsWith('viking://resources/')}
+              onClick={() => setBrowseUri('viking://resources/')}
+            >
+              {t('dirPicker.shared')}
+            </Button>
+          </div>
+        )}
         {/* Breadcrumb */}
         <div className="flex flex-wrap items-center gap-1 text-sm">
           {breadcrumbs.map((crumb, i) => (
@@ -149,6 +192,7 @@ export function DirectoryPickerDialog({
             <div className="flex flex-col items-center justify-center gap-2 py-12 text-muted-foreground">
               <FolderOpen className="size-8" />
               <p className="text-sm">{t('dirPicker.empty')}</p>
+              {emptyAction}
             </div>
           )}
         </ScrollArea>
@@ -164,6 +208,7 @@ export function DirectoryPickerDialog({
             {t('dirPicker.cancel')}
           </Button>
           <Button
+            disabled={dirQuery.isLoading || dirQuery.isError}
             onClick={() => {
               onSelect(normalizedUri)
               onOpenChange(false)

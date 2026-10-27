@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+
 from __future__ import annotations
 
 import base64
@@ -5,11 +8,9 @@ import inspect
 import mimetypes
 import os
 import tempfile
-import uuid
-import zipfile
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Type, TypeVar, Union, cast
 from urllib.parse import quote
 
 import httpx
@@ -47,22 +48,28 @@ from .options import (
     BatchAddMessagesOptions,
     BatchWriteOptions,
     CommitSessionOptions,
+    CompileOptions,
     CreateSessionOptions,
     ExperienceOutcomeOptions,
     ExperienceTrajectoryOptions,
     FindOptions,
+    ListPage,
     Message,
     PreflightAssetOptions,
     ReindexOptions,
     ResolveAssetsOptions,
+    RuleCompileOptions,
+    RuleSearchOptions,
     SearchContextOptions,
     SearchContextResult,
     SearchOptions,
     SetTagsOptions,
+    TreePage,
     UpdateSessionConfigOptions,
     UpdateSkillOptions,
     WriteOptions,
 )
+from .uploads import zip_directory
 
 ERROR_CODE_TO_EXCEPTION = {
     "INVALID_ARGUMENT": InvalidArgumentError,
@@ -90,6 +97,28 @@ ERROR_CODE_TO_EXCEPTION = {
 GATEWAY_MARKER_HEADER = "X-VikingBot-Gateway"
 GATEWAY_TOKEN_HEADER = "X-Gateway-Token"
 _SESSION_CONFIG_UNSET = object()
+_OptionsT = TypeVar("_OptionsT", bound=Mapping[str, Any])
+
+
+def _option_keys(options_type: Type[Any]) -> set[str]:
+    optional_keys = getattr(options_type, "__optional_keys__", None)
+    required_keys = getattr(options_type, "__required_keys__", None)
+    if optional_keys is not None and required_keys is not None:
+        return set(optional_keys) | set(required_keys)
+    return set(getattr(options_type, "__annotations__", {}))
+
+
+def _normalize_timeout_options(timeout: Any, options: Optional[_OptionsT]) -> Optional[_OptionsT]:
+    """Accept options in the positional slot used after timeout was removed.
+
+    Timeout values are deprecated and ignored. A mapping in that slot is treated
+    as options; supplying options in both slots is an error.
+    """
+    if isinstance(timeout, Mapping):
+        if options is not None:
+            raise TypeError("options were provided in both the timeout and options slots")
+        return cast(_OptionsT, timeout)
+    return options
 
 
 def _image_mime_type(file_name: str = "") -> str:
@@ -123,9 +152,11 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
-def _normalize_image_input(image: Any) -> Optional[str]:
+def _normalize_image_input(image: Any) -> str | list[str] | None:
     if image is None:
         return None
+    if isinstance(image, list):
+        return [_normalize_image_input(item) for item in image]
     if isinstance(image, (bytes, bytearray, memoryview)):
         return _image_to_data_uri(image)
     value = os.fspath(image) if isinstance(image, os.PathLike) else str(image)
@@ -470,12 +501,6 @@ class AsyncHTTPClient:
         retry_headers[GATEWAY_TOKEN_HEADER] = self._gateway_token
         return await self._send_http_request(method, url, retry_headers, request_kwargs)
 
-    def _wait_request_kwargs(self, *, wait: bool, timeout: Optional[float]) -> Dict[str, Any]:
-        if not wait or timeout is None:
-            return {}
-        read_timeout = max(self._timeout, timeout + 30.0)
-        return {"timeout": httpx.Timeout(self._timeout, read=read_timeout)}
-
     async def close(self) -> None:
         if self._http:
             try:
@@ -543,7 +568,7 @@ class AsyncHTTPClient:
         protected: Optional[set[str]] = None,
     ) -> Dict[str, Any]:
         option_values = dict(options or {})
-        allowed = set(options_type.__optional_keys__) | set(options_type.__required_keys__)
+        allowed = _option_keys(options_type)
         unknown = sorted(set(option_values) - allowed)
         if unknown:
             raise TypeError(
@@ -581,7 +606,7 @@ class AsyncHTTPClient:
                 option_values["context_type"]
             )
 
-        allowed = set(options_type.__optional_keys__) | set(options_type.__required_keys__)
+        allowed = _option_keys(options_type)
         allowed.discard("image")
         allowed.add("image_url")
         proxy_type = type(
@@ -640,53 +665,40 @@ class AsyncHTTPClient:
         exc_class = ERROR_CODE_TO_EXCEPTION.get(code, OpenVikingError)
 
         if exc_class == OpenVikingError:
-            raise exc_class(message, code=code, details=details)
-        if exc_class in (
+            exception = exc_class(message, code=code, details=details)
+        elif exc_class in (
             InvalidArgumentError,
             FailedPreconditionError,
             ResourceExhaustedError,
             AbortedError,
             UnimplementedError,
         ):
-            raise exc_class(message, details=details)
-        if exc_class == InvalidURIError:
+            exception = exc_class(message, details=details)
+        elif exc_class == InvalidURIError:
             uri = details.get("uri", "") if details else ""
             reason = details.get("reason", "") if details else ""
-            raise exc_class(uri, reason)
-        if exc_class == NotFoundError:
+            exception = exc_class(uri, reason)
+        elif exc_class == NotFoundError:
             resource = details.get("resource", "") if details else ""
             resource_type = details.get("type", "resource") if details else "resource"
             reason = details.get("reason") if details else None
-            raise exc_class(resource, resource_type, reason=reason)
-        if exc_class == AlreadyExistsError:
+            exception = exc_class(resource, resource_type, reason=reason)
+        elif exc_class == AlreadyExistsError:
             resource = details.get("resource", "") if details else ""
             resource_type = details.get("type", "resource") if details else "resource"
-            raise exc_class(resource, resource_type)
-        if exc_class == UnavailableError:
+            exception = exc_class(resource, resource_type)
+        elif exc_class == UnavailableError:
             service = details.get("service", "service") if details else "service"
             reason = details.get("reason", "") if details else message
-            raise exc_class(service, reason)
-        raise exc_class(message)
+            exception = exc_class(service, reason)
+        else:
+            exception = exc_class(message)
+        if details is not None:
+            exception.details.update(details)
+        raise exception
 
     def _zip_directory(self, dir_path: str) -> str:
-        dir_path = Path(dir_path)
-        if not dir_path.is_dir():
-            raise ValueError(f"Path {dir_path} is not a directory")
-
-        root = dir_path.resolve()
-        zip_path = Path(tempfile.gettempdir()) / f"temp_upload_{uuid.uuid4().hex}.zip"
-        entry_count = 0
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for file_path in dir_path.rglob("*"):
-                if file_path.is_symlink():
-                    continue
-                if file_path.is_file():
-                    if not file_path.resolve().is_relative_to(root):
-                        continue
-                    arcname = str(file_path.relative_to(dir_path)).replace("\\", "/")
-                    zipf.write(file_path, arcname=arcname)
-                    entry_count += 1
-        return str(zip_path)
+        return zip_directory(dir_path)
 
     async def _upload_temp_file(self, file_path: str) -> str:
         with open(file_path, "rb") as f:
@@ -717,10 +729,10 @@ class AsyncHTTPClient:
         to: Optional[str] = None,
         parent: Optional[str] = None,
         wait: bool = False,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # Deprecated and ignored.
         options: Optional[AddResourceOptions] = None,
     ) -> Dict[str, Any]:
-        option_values = dict(options or {})
+        option_values = dict(_normalize_timeout_options(timeout, options) or {})
         add_type = option_values.get("add_type")
         if add_type is not None:
             add_type = add_type.strip() or None
@@ -744,7 +756,6 @@ class AsyncHTTPClient:
                 "to": to,
                 "parent": parent,
                 "wait": wait,
-                "timeout": timeout,
             },
             protected={"path", "temp_file_id", "source_name"},
         )
@@ -794,16 +805,16 @@ class AsyncHTTPClient:
         self,
         data: Any,
         wait: bool = False,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # Deprecated and ignored.
         options: Optional[AddSkillOptions] = None,
     ) -> Dict[str, Any]:
-        option_values = dict(options or {})
+        option_values = dict(_normalize_timeout_options(timeout, options) or {})
         if "target_uri" in option_values:
             option_values["target_uri"] = VikingURI.normalize(option_values["target_uri"])
         request_data = self._build_options_payload(
             option_values,
             AddSkillOptions,
-            fixed={"wait": wait, "timeout": timeout},
+            fixed={"wait": wait},
             protected={"data", "temp_file_id"},
         )
         if isinstance(data, str):
@@ -905,16 +916,16 @@ class AsyncHTTPClient:
         skill_name: str,
         data: Any,
         wait: bool = False,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # Deprecated and ignored.
         options: Optional[UpdateSkillOptions] = None,
     ) -> Dict[str, Any]:
-        option_values = dict(options or {})
+        option_values = dict(_normalize_timeout_options(timeout, options) or {})
         if "target_uri" in option_values:
             option_values["target_uri"] = VikingURI.normalize(option_values["target_uri"])
         request_data = self._build_options_payload(
             option_values,
             UpdateSkillOptions,
-            fixed={"wait": wait, "timeout": timeout},
+            fixed={"wait": wait},
             protected={"data", "temp_file_id"},
         )
         if isinstance(data, str):
@@ -1042,12 +1053,11 @@ class AsyncHTTPClient:
         return self._handle_response(response)
 
     async def wait_processed(self, timeout: Optional[float] = None) -> Dict[str, Any]:
-        http_timeout = timeout if timeout else 600.0
+        """Wait for processing; timeout is deprecated and ignored."""
         response = await self._request(
             "POST",
             "/api/v1/system/wait",
-            json={"timeout": timeout},
-            timeout=http_timeout,
+            json={},
         )
         return self._handle_response(response)
 
@@ -1067,7 +1077,51 @@ class AsyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
     ) -> List[Any]:
+        page = await self.ls_page(
+            uri,
+            simple=simple,
+            recursive=recursive,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+        )
+        return page["result"]
+
+    async def ls_page(
+        self,
+        uri: str,
+        simple: bool = False,
+        recursive: bool = False,
+        output: str = "original",
+        abs_limit: int = 256,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+    ) -> ListPage:
         params: Dict[str, Any] = {
             "uri": VikingURI.normalize(uri),
             "simple": simple,
@@ -1077,7 +1131,12 @@ class AsyncHTTPClient:
             "show_all_hidden": show_all_hidden,
             "node_limit": node_limit,
             "offset": offset,
+            "overview_limit": overview_limit,
         }
+        if include_abstract is not None:
+            params["include_abstract"] = include_abstract
+        if include_overview is not None:
+            params["include_overview"] = include_overview
         if sort_by is not None:
             params["sort_by"] = sort_by
             params["sort_order"] = sort_order
@@ -1094,7 +1153,11 @@ class AsyncHTTPClient:
             "/api/v1/fs/ls",
             params=params,
         )
-        return self._handle_response(response)
+        data = self._handle_response_data(response)
+        return {
+            "result": data.get("result") or [],
+            "has_more": bool(data.get("has_more", False)),
+        }
 
     async def tree(
         self,
@@ -1109,7 +1172,48 @@ class AsyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
     ) -> List[Dict[str, Any]]:
+        page = await self.tree_page(
+            uri,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            level_limit=level_limit,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+            directories_only=directories_only,
+        )
+        return page["result"]
+
+    async def tree_page(
+        self,
+        uri: str,
+        output: str = "original",
+        abs_limit: int = 128,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        level_limit: int = 3,
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
+    ) -> TreePage:
         params: Dict[str, Any] = {
             "uri": VikingURI.normalize(uri),
             "output": output,
@@ -1118,7 +1222,14 @@ class AsyncHTTPClient:
             "node_limit": node_limit,
             "level_limit": level_limit,
             "offset": offset,
+            "overview_limit": overview_limit,
         }
+        if include_abstract is not None:
+            params["include_abstract"] = include_abstract
+        if include_overview is not None:
+            params["include_overview"] = include_overview
+        if directories_only:
+            params["directories_only"] = True
         if extra_fields:
             params["extra_fields"] = list(extra_fields)
         if tags is not None:
@@ -1132,7 +1243,11 @@ class AsyncHTTPClient:
             "/api/v1/fs/tree",
             params=params,
         )
-        return self._handle_response(response)
+        data = self._handle_response_data(response)
+        return {
+            "result": data.get("result") or [],
+            "has_more": bool(data.get("has_more", False)),
+        }
 
     async def stat(self, uri: str) -> Dict[str, Any]:
         response = await self._request(
@@ -1148,10 +1263,14 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
-    async def mkdir(self, uri: str, description: Optional[str] = None) -> None:
+    async def mkdir(
+        self, uri: str, description: Optional[str] = None, *, acl: Optional[Dict[str, Any]] = None
+    ) -> None:
         payload = {"uri": VikingURI.normalize(uri)}
         if description is not None:
             payload["description"] = description
+        if acl is not None:
+            payload["acl"] = acl
         response = await self._request("POST", "/api/v1/fs/mkdir", json=payload)
         self._handle_response(response)
 
@@ -1160,11 +1279,9 @@ class AsyncHTTPClient:
         uri: str,
         recursive: bool = False,
         wait: bool = False,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # Deprecated and ignored.
     ) -> None:
         params = {"uri": VikingURI.normalize(uri), "recursive": recursive, "wait": wait}
-        if timeout is not None:
-            params["timeout"] = timeout
         response = await self._request("DELETE", "/api/v1/fs", params=params)
         self._handle_response(response)
 
@@ -1231,18 +1348,17 @@ class AsyncHTTPClient:
         content: str,
         mode: str = "replace",
         wait: bool = False,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # Deprecated and ignored.
         options: Optional[WriteOptions] = None,
     ) -> Dict[str, Any]:
         payload = self._build_options_payload(
-            options,
+            _normalize_timeout_options(timeout, options),
             WriteOptions,
             fixed={
                 "uri": VikingURI.normalize(uri),
                 "content": content,
                 "mode": mode,
                 "wait": wait,
-                "timeout": timeout,
             },
         )
         response = await self._request(
@@ -1257,7 +1373,7 @@ class AsyncHTTPClient:
         root_uri: str,
         operations: List[Dict[str, Any]],
         wait: bool = True,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # Deprecated and ignored.
         options: Optional[BatchWriteOptions] = None,
     ) -> Dict[str, Any]:
         """Apply multiple content writes, then refresh semantics once."""
@@ -1267,40 +1383,40 @@ class AsyncHTTPClient:
             item["uri"] = VikingURI.normalize(str(item.get("uri") or ""))
             normalized_operations.append(item)
         payload = self._build_options_payload(
-            options,
+            _normalize_timeout_options(timeout, options),
             BatchWriteOptions,
             fixed={
                 "root_uri": VikingURI.normalize(root_uri),
                 "operations": normalized_operations,
                 "wait": wait,
-                "timeout": timeout,
             },
         )
         response = await self._request(
             "POST",
             "/api/v1/content/batch-write",
             json=payload,
-            **self._wait_request_kwargs(wait=wait, timeout=timeout),
         )
         return self._handle_response_data(response).get("result", {})
 
     async def set_tags(
         self,
         uri: str,
-        tags: List[str],
+        tags: Optional[List[str]] = None,
         mode: str = "replace",
         recursive: bool = False,
         options: Optional[SetTagsOptions] = None,
     ) -> Dict[str, Any]:
+        fixed: Dict[str, Any] = {
+            "uri": VikingURI.normalize(uri),
+            "mode": mode,
+            "recursive": recursive,
+        }
+        if tags is not None:
+            fixed["tags"] = tags
         payload = self._build_options_payload(
             options,
             SetTagsOptions,
-            fixed={
-                "uri": VikingURI.normalize(uri),
-                "tags": tags,
-                "mode": mode,
-                "recursive": recursive,
-            },
+            fixed=fixed,
         )
         response = await self._request(
             "POST",
@@ -1313,10 +1429,23 @@ class AsyncHTTPClient:
         response = await self._http.get("/api/v1/acl", params={"uri": VikingURI.normalize(uri)})
         return self._handle_response_data(response).get("result", {})
 
-    async def acl_set(self, uri: str, entries: List[Dict[str, str]]) -> Dict[str, Any]:
+    async def acl_set(
+        self,
+        uri: str,
+        entries: Optional[List[Dict[str, str]]] = None,
+        *,
+        acl_mode: Optional[Literal["inherit", "restricted"]] = None,
+    ) -> Dict[str, Any]:
+        if entries is None and acl_mode is None:
+            raise ValueError("Either entries or acl_mode must be provided")
+        payload: Dict[str, Any] = {"uri": VikingURI.normalize(uri)}
+        if entries is not None:
+            payload["entries"] = entries
+        if acl_mode is not None:
+            payload["acl_mode"] = acl_mode
         response = await self._http.put(
             "/api/v1/acl",
-            json={"uri": VikingURI.normalize(uri), "entries": entries},
+            json=payload,
         )
         return self._handle_response_data(response).get("result", {})
 
@@ -1427,6 +1556,7 @@ class AsyncHTTPClient:
         exclude_uri: Optional[str] = None,
         tags: Optional[List[str]] = None,
         include_tags: bool = False,
+        level_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         request_json = {
             "uri": VikingURI.normalize(uri),
@@ -1434,6 +1564,8 @@ class AsyncHTTPClient:
             "case_insensitive": case_insensitive,
             "node_limit": node_limit,
         }
+        if level_limit is not None:
+            request_json["level_limit"] = level_limit
         if exclude_uri is not None:
             request_json["exclude_uri"] = VikingURI.normalize(exclude_uri)
         if tags is not None:
@@ -1541,6 +1673,117 @@ class AsyncHTTPClient:
         response = await self._request("GET", f"/api/v1/tasks/{task_id}")
         if response.status_code == 404:
             return None
+        return self._handle_response(response)
+
+    async def compile(
+        self,
+        from_uris: List[str],
+        to: str,
+        skill: str,
+        options: Optional[CompileOptions] = None,
+    ) -> Dict[str, Any]:
+        payload = self._build_options_payload(
+            options,
+            CompileOptions,
+            fixed={"from": list(from_uris), "to": to, "skill": skill},
+        )
+        response = await self._request("POST", "/api/v1/compile", json=payload)
+        return self._handle_response(response)
+
+    async def rule_compile(
+        self,
+        instruction: Optional[str] = None,
+        options: Optional[RuleCompileOptions] = None,
+    ) -> Dict[str, Any]:
+        """Compile inline instructions and resource-backed files into durable rules."""
+        option_values = dict(options or {})
+        raw_sources: Any = option_values.pop("sources", [])
+        if option_values:
+            names = ", ".join(sorted(option_values))
+            raise ValueError(f"Unsupported rule compile options: {names}")
+        if not isinstance(raw_sources, list):
+            raise ValueError("Rule compile sources must be a list")
+
+        sources: List[Dict[str, Any]] = []
+        for source in raw_sources:
+            if isinstance(source, dict):
+                normalized = dict(source)
+                if normalized.get("resource_uri"):
+                    normalized["resource_uri"] = VikingURI.normalize(
+                        str(normalized["resource_uri"])
+                    )
+                    sources.append(normalized)
+                    continue
+                for target_field in ("to", "parent"):
+                    if normalized.get(target_field):
+                        normalized[target_field] = VikingURI.normalize(
+                            str(normalized[target_field])
+                        )
+                path_value = normalized.get("path")
+                if isinstance(path_value, str):
+                    local_path = Path(path_value).expanduser()
+                    if local_path.exists() and not normalized.get("add_type"):
+                        normalized.pop("path")
+                        normalized.setdefault("source_name", local_path.name)
+                        if local_path.is_dir():
+                            zip_path = self._zip_directory(str(local_path))
+                            try:
+                                normalized["temp_file_id"] = await self._upload_temp_file(zip_path)
+                            finally:
+                                Path(zip_path).unlink(missing_ok=True)
+                        else:
+                            normalized["temp_file_id"] = await self._upload_temp_file(
+                                str(local_path)
+                            )
+                sources.append(normalized)
+                continue
+
+            value = os.fspath(source)
+            if value.startswith("viking://"):
+                sources.append({"resource_uri": VikingURI.normalize(value)})
+                continue
+            path = Path(value).expanduser()
+            if path.is_dir():
+                zip_path = self._zip_directory(str(path))
+                try:
+                    temp_file_id = await self._upload_temp_file(zip_path)
+                finally:
+                    Path(zip_path).unlink(missing_ok=True)
+                sources.append(
+                    {
+                        "temp_file_id": temp_file_id,
+                        "source_name": path.name,
+                    }
+                )
+            elif path.is_file():
+                sources.append(
+                    {
+                        "temp_file_id": await self._upload_temp_file(str(path)),
+                        "source_name": path.name,
+                    }
+                )
+            else:
+                sources.append({"path": value})
+
+        payload = {"instruction": instruction, "sources": sources}
+        response = await self._request(
+            "POST",
+            "/api/v1/rules/compile",
+            json=self._compact_request_body(payload),
+        )
+        return self._handle_response(response)
+
+    async def rule_search(
+        self,
+        task_context: str,
+        options: Optional[RuleSearchOptions] = None,
+    ) -> Dict[str, Any]:
+        payload = self._build_options_payload(
+            options,
+            RuleSearchOptions,
+            fixed={"task_context": task_context},
+        )
+        response = await self._request("POST", "/api/v1/rules/search", json=payload)
         return self._handle_response(response)
 
     async def cancel_task(self, task_id: str) -> Dict[str, Any]:
@@ -1734,8 +1977,8 @@ class AsyncHTTPClient:
         uri: str,
         mode: str = "vectors_only",
         wait: bool = True,
-        dry_run: bool = False,
         recursive: bool = True,
+        force: bool = False,
         options: Optional[ReindexOptions] = None,
     ) -> Dict[str, Any]:
         payload = self._build_options_payload(
@@ -1745,10 +1988,12 @@ class AsyncHTTPClient:
                 "uri": VikingURI.normalize(uri),
                 "mode": mode,
                 "wait": wait,
-                "dry_run": dry_run,
+                "force": force,
                 "recursive": recursive,
             },
         )
+        if not payload.get("force"):
+            payload.pop("force", None)
         response = await self._request(
             "POST",
             "/api/v1/content/reindex",
@@ -1756,20 +2001,32 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
-    async def _get_queue_status(self) -> Dict[str, Any]:
-        response = await self._request("GET", "/api/v1/observer/queue")
+    async def _get_queue_status(
+        self, format: Optional[Literal["table", "json"]] = None
+    ) -> Dict[str, Any]:
+        params = {"format": format} if format is not None else None
+        response = await self._request("GET", "/api/v1/observer/queue", params=params)
         return self._handle_response(response)
 
-    async def _get_vikingdb_status(self) -> Dict[str, Any]:
-        response = await self._request("GET", "/api/v1/observer/vikingdb")
+    async def _get_vikingdb_status(
+        self, format: Optional[Literal["table", "json"]] = None
+    ) -> Dict[str, Any]:
+        params = {"format": format} if format is not None else None
+        response = await self._request("GET", "/api/v1/observer/vikingdb", params=params)
         return self._handle_response(response)
 
-    async def _get_models_status(self) -> Dict[str, Any]:
-        response = await self._request("GET", "/api/v1/observer/models")
+    async def _get_models_status(
+        self, format: Optional[Literal["table", "json"]] = None
+    ) -> Dict[str, Any]:
+        params = {"format": format} if format is not None else None
+        response = await self._request("GET", "/api/v1/observer/models", params=params)
         return self._handle_response(response)
 
-    async def _get_system_status(self) -> Dict[str, Any]:
-        response = await self._request("GET", "/api/v1/observer/system")
+    async def _get_system_status(
+        self, format: Optional[Literal["table", "json"]] = None
+    ) -> Dict[str, Any]:
+        params = {"format": format} if format is not None else None
+        response = await self._request("GET", "/api/v1/observer/system", params=params)
         return self._handle_response(response)
 
     async def admin_create_account(
@@ -1796,6 +2053,7 @@ class AsyncHTTPClient:
         name: Optional[str] = None,
         limit: Optional[int] = None,
         page: int = 1,
+        query: Optional[str] = None,
     ) -> List[Any]:
         params: Dict[str, Any] = {}
         if name is not None:
@@ -1803,7 +2061,17 @@ class AsyncHTTPClient:
         if limit is not None:
             params["limit"] = limit
             params["page"] = page
+        if query is not None:
+            params["query"] = query
         response = await self._request("GET", "/api/v1/admin/accounts", params=params)
+        return self._handle_response(response)
+
+    async def admin_get_account(self, account_id: str) -> Dict[str, Any]:
+        """Return one account's credential-free metadata.
+
+        Raises NotFoundError when the account does not exist.
+        """
+        response = await self._request("GET", f"/api/v1/admin/accounts/{account_id}")
         return self._handle_response(response)
 
     async def admin_delete_account(self, account_id: str) -> Dict[str, Any]:
@@ -1837,6 +2105,7 @@ class AsyncHTTPClient:
         name: Optional[str] = None,
         role: Optional[str] = None,
         page: int = 1,
+        query: Optional[str] = None,
     ) -> List[Any]:
         params: Dict[str, Any] = {}
         if limit is not None:
@@ -1846,8 +2115,22 @@ class AsyncHTTPClient:
             params["name"] = name
         if role is not None:
             params["role"] = role
+        if query is not None:
+            params["query"] = query
         response = await self._request(
             "GET", f"/api/v1/admin/accounts/{account_id}/users", params=params
+        )
+        return self._handle_response(response)
+
+    async def admin_get_user(self, account_id: str, user_id: str) -> Dict[str, Any]:
+        """Return one user's credential-free membership info (user_id, role).
+
+        Raises NotFoundError when the user does not exist. Never returns
+        api_key or key_prefix.
+        """
+        response = await self._request(
+            "GET",
+            f"/api/v1/admin/accounts/{account_id}/users/{user_id}",
         )
         return self._handle_response(response)
 
@@ -2015,8 +2298,17 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
-    def get_status(self) -> Dict[str, Any]:
-        return run_async(self._get_system_status())
+    def queue_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
+        return run_async(self._get_queue_status(format=format))
+
+    def vikingdb_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
+        return run_async(self._get_vikingdb_status(format=format))
+
+    def models_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
+        return run_async(self._get_models_status(format=format))
+
+    def get_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
+        return run_async(self._get_system_status(format=format))
 
     def is_healthy(self) -> bool:
         return self.observer.is_healthy()
@@ -2139,6 +2431,22 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
+    async def git_diff_paths(
+        self,
+        paths: List[str],
+        *,
+        to_ref: str,
+        from_ref: Optional[str] = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Page changed source URIs under directories; a null base means an empty tree."""
+        params: Dict[str, Any] = {"paths": paths, "to": to_ref, "offset": offset, "limit": limit}
+        if from_ref is not None:
+            params["from"] = from_ref
+        response = await self._request("GET", "/api/v1/snapshot/diff-paths", params=params)
+        return self._handle_response(response)
+
     async def git_get_ignore(self) -> str:
         """Return the account ``.ovgitignore`` content (empty string if absent)."""
         response = await self._request("GET", "/api/v1/snapshot/ignore")
@@ -2197,7 +2505,7 @@ class SyncHTTPClient:
         to: Optional[str] = None,
         parent: Optional[str] = None,
         wait: bool = False,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # Deprecated and ignored.
         options: Optional[AddResourceOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
@@ -2206,8 +2514,7 @@ class SyncHTTPClient:
                 to=to,
                 parent=parent,
                 wait=wait,
-                timeout=timeout,
-                options=options,
+                options=_normalize_timeout_options(timeout, options),
             )
         )
 
@@ -2223,11 +2530,13 @@ class SyncHTTPClient:
         self,
         data: Any,
         wait: bool = False,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # Deprecated and ignored.
         options: Optional[AddSkillOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
-            self._async_client.add_skill(data, wait=wait, timeout=timeout, options=options)
+            self._async_client.add_skill(
+                data, wait=wait, options=_normalize_timeout_options(timeout, options)
+            )
         )
 
     def list_skills(
@@ -2304,12 +2613,12 @@ class SyncHTTPClient:
         skill_name: str,
         data: Any,
         wait: bool = False,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # Deprecated and ignored.
         options: Optional[UpdateSkillOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
             self._async_client.update_skill(
-                skill_name, data, wait=wait, timeout=timeout, options=options
+                skill_name, data, wait=wait, options=_normalize_timeout_options(timeout, options)
             )
         )
 
@@ -2372,7 +2681,8 @@ class SyncHTTPClient:
         return run_async(self._async_client.trigger_watch(task_id, to_uri=to_uri))
 
     def wait_processed(self, timeout: Optional[float] = None) -> Dict[str, Any]:
-        return run_async(self._async_client.wait_processed(timeout))
+        """Wait for processing; timeout is deprecated and ignored."""
+        return run_async(self._async_client.wait_processed())
 
     def ls(
         self,
@@ -2390,9 +2700,52 @@ class SyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
     ) -> List[Any]:
+        return self.ls_page(
+            uri,
+            simple=simple,
+            recursive=recursive,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+        )["result"]
+
+    def ls_page(
+        self,
+        uri: str,
+        simple: bool = False,
+        recursive: bool = False,
+        output: str = "original",
+        abs_limit: int = 256,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+    ) -> ListPage:
         return run_async(
-            self._async_client.ls(
+            self._async_client.ls_page(
                 uri,
                 simple=simple,
                 recursive=recursive,
@@ -2407,6 +2760,9 @@ class SyncHTTPClient:
                 include_tags=include_tags,
                 offset=offset,
                 limit=limit,
+                include_abstract=include_abstract,
+                include_overview=include_overview,
+                overview_limit=overview_limit,
             )
         )
 
@@ -2423,9 +2779,49 @@ class SyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
     ) -> List[Dict[str, Any]]:
+        return self.tree_page(
+            uri,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            level_limit=level_limit,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+            directories_only=directories_only,
+        )["result"]
+
+    def tree_page(
+        self,
+        uri: str,
+        output: str = "original",
+        abs_limit: int = 128,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        level_limit: int = 3,
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
+    ) -> TreePage:
         return run_async(
-            self._async_client.tree(
+            self._async_client.tree_page(
                 uri,
                 output=output,
                 abs_limit=abs_limit,
@@ -2437,6 +2833,10 @@ class SyncHTTPClient:
                 include_tags=include_tags,
                 offset=offset,
                 limit=limit,
+                include_abstract=include_abstract,
+                include_overview=include_overview,
+                overview_limit=overview_limit,
+                directories_only=directories_only,
             )
         )
 
@@ -2446,17 +2846,19 @@ class SyncHTTPClient:
     def attrs(self, uri: str) -> Dict[str, Any]:
         return run_async(self._async_client.attrs(uri))
 
-    def mkdir(self, uri: str, description: Optional[str] = None) -> None:
-        run_async(self._async_client.mkdir(uri, description=description))
+    def mkdir(
+        self, uri: str, description: Optional[str] = None, *, acl: Optional[Dict[str, Any]] = None
+    ) -> None:
+        run_async(self._async_client.mkdir(uri, description=description, acl=acl))
 
     def rm(
         self,
         uri: str,
         recursive: bool = False,
         wait: bool = False,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # Deprecated and ignored.
     ) -> None:
-        run_async(self._async_client.rm(uri, recursive=recursive, wait=wait, timeout=timeout))
+        run_async(self._async_client.rm(uri, recursive=recursive, wait=wait))
 
     def mv(self, from_uri: str, to_uri: str) -> None:
         run_async(self._async_client.mv(from_uri, to_uri))
@@ -2482,12 +2884,16 @@ class SyncHTTPClient:
         content: str,
         mode: str = "replace",
         wait: bool = False,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # Deprecated and ignored.
         options: Optional[WriteOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
             self._async_client.write(
-                uri, content, mode=mode, wait=wait, timeout=timeout, options=options
+                uri,
+                content,
+                mode=mode,
+                wait=wait,
+                options=_normalize_timeout_options(timeout, options),
             )
         )
 
@@ -2496,19 +2902,22 @@ class SyncHTTPClient:
         root_uri: str,
         operations: List[Dict[str, Any]],
         wait: bool = True,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None,  # Deprecated and ignored.
         options: Optional[BatchWriteOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
             self._async_client.batch_write(
-                root_uri, operations, wait=wait, timeout=timeout, options=options
+                root_uri,
+                operations,
+                wait=wait,
+                options=_normalize_timeout_options(timeout, options),
             )
         )
 
     def set_tags(
         self,
         uri: str,
-        tags: List[str],
+        tags: Optional[List[str]] = None,
         mode: str = "replace",
         recursive: bool = False,
         options: Optional[SetTagsOptions] = None,
@@ -2520,8 +2929,14 @@ class SyncHTTPClient:
     def acl_get(self, uri: str) -> Dict[str, Any]:
         return run_async(self._async_client.acl_get(uri))
 
-    def acl_set(self, uri: str, entries: List[Dict[str, str]]) -> Dict[str, Any]:
-        return run_async(self._async_client.acl_set(uri, entries))
+    def acl_set(
+        self,
+        uri: str,
+        entries: Optional[List[Dict[str, str]]] = None,
+        *,
+        acl_mode: Optional[Literal["inherit", "restricted"]] = None,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.acl_set(uri, entries, acl_mode=acl_mode))
 
     def acl_grant(self, uri: str, principal: str, level: str) -> Dict[str, Any]:
         return run_async(self._async_client.acl_grant(uri, principal, level))
@@ -2599,6 +3014,7 @@ class SyncHTTPClient:
         exclude_uri: Optional[str] = None,
         tags: Optional[List[str]] = None,
         include_tags: bool = False,
+        level_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         return run_async(
             self._async_client.grep(
@@ -2609,6 +3025,7 @@ class SyncHTTPClient:
                 exclude_uri=exclude_uri,
                 tags=tags,
                 include_tags=include_tags,
+                level_limit=level_limit,
             )
         )
 
@@ -2663,6 +3080,29 @@ class SyncHTTPClient:
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         return run_async(self._async_client.get_task(task_id))
+
+    def compile(
+        self,
+        from_uris: List[str],
+        to: str,
+        skill: str,
+        options: Optional[CompileOptions] = None,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.compile(from_uris, to, skill, options))
+
+    def rule_compile(
+        self,
+        instruction: Optional[str] = None,
+        options: Optional[RuleCompileOptions] = None,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.rule_compile(instruction, options))
+
+    def rule_search(
+        self,
+        task_context: str,
+        options: Optional[RuleSearchOptions] = None,
+    ) -> Dict[str, Any]:
+        return run_async(self._async_client.rule_search(task_context, options))
 
     def cancel_task(self, task_id: str) -> Dict[str, Any]:
         return run_async(self._async_client.cancel_task(task_id))
@@ -2766,20 +3206,19 @@ class SyncHTTPClient:
         uri: str,
         mode: str = "vectors_only",
         wait: bool = True,
-        dry_run: bool = False,
         recursive: bool = True,
+        force: bool = False,
         options: Optional[ReindexOptions] = None,
     ) -> Dict[str, Any]:
-        return run_async(
-            self._async_client.reindex(
-                uri,
-                mode=mode,
-                wait=wait,
-                dry_run=dry_run,
-                recursive=recursive,
-                options=options,
-            )
-        )
+        kwargs: Dict[str, Any] = {
+            "mode": mode,
+            "wait": wait,
+            "recursive": recursive,
+            "options": options,
+        }
+        if force:
+            kwargs["force"] = True
+        return run_async(self._async_client.reindex(uri, **kwargs))
 
     def admin_create_account(
         self,
@@ -2802,11 +3241,17 @@ class SyncHTTPClient:
         name: Optional[str] = None,
         limit: Optional[int] = None,
         page: int = 1,
+        query: Optional[str] = None,
     ) -> List[Any]:
-        return run_async(self._async_client.admin_list_accounts(name=name, limit=limit, page=page))
+        return run_async(
+            self._async_client.admin_list_accounts(name=name, limit=limit, page=page, query=query)
+        )
 
     def admin_delete_account(self, account_id: str) -> Dict[str, Any]:
         return run_async(self._async_client.admin_delete_account(account_id))
+
+    def admin_get_account(self, account_id: str) -> Dict[str, Any]:
+        return run_async(self._async_client.admin_get_account(account_id))
 
     def admin_register_user(
         self,
@@ -2833,15 +3278,19 @@ class SyncHTTPClient:
         name: Optional[str] = None,
         role: Optional[str] = None,
         page: int = 1,
+        query: Optional[str] = None,
     ) -> List[Any]:
         return run_async(
             self._async_client.admin_list_users(
-                account_id, limit=limit, name=name, role=role, page=page
+                account_id, limit=limit, name=name, role=role, page=page, query=query
             )
         )
 
     def admin_remove_user(self, account_id: str, user_id: str) -> Dict[str, Any]:
         return run_async(self._async_client.admin_remove_user(account_id, user_id))
+
+    def admin_get_user(self, account_id: str, user_id: str) -> Dict[str, Any]:
+        return run_async(self._async_client.admin_get_user(account_id, user_id))
 
     def admin_set_role(self, account_id: str, user_id: str, role: str) -> Dict[str, Any]:
         return run_async(self._async_client.admin_set_role(account_id, user_id, role))
@@ -2919,8 +3368,17 @@ class SyncHTTPClient:
     ) -> Dict[str, Any]:
         return run_async(self._async_client.preflight_openviking_asset(name, repo_url, options))
 
-    def get_status(self) -> Dict[str, Any]:
-        return self._async_client.get_status()
+    def queue_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
+        return self._async_client.queue_status(format=format)
+
+    def vikingdb_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
+        return self._async_client.vikingdb_status(format=format)
+
+    def models_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
+        return self._async_client.models_status(format=format)
+
+    def get_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
+        return self._async_client.get_status(format=format)
 
     def is_healthy(self) -> bool:
         return self._async_client.is_healthy()
@@ -3022,6 +3480,20 @@ class AsyncHTTPSnapshotNamespace:
             to_ref=to_ref,
         )
 
+    async def diff_paths(
+        self,
+        paths: List[str],
+        *,
+        to_ref: str,
+        from_ref: Optional[str] = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Page changed source URIs between snapshots under the supplied directories."""
+        return await self._client.git_diff_paths(
+            paths, from_ref=from_ref, to_ref=to_ref, offset=offset, limit=limit
+        )
+
     async def get_gitignore(self) -> str:
         return await self._client.git_get_ignore()
 
@@ -3109,6 +3581,22 @@ class SyncHTTPSnapshotNamespace:
     ) -> Dict[str, Any]:
         """Compare one file between two snapshot refs."""
         return run_async(self._ns().diff(path, from_ref=from_ref, to_ref=to_ref))
+
+    def diff_paths(
+        self,
+        paths: List[str],
+        *,
+        to_ref: str,
+        from_ref: Optional[str] = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Page changed source URIs between snapshots under the supplied directories."""
+        return run_async(
+            self._ns().diff_paths(
+                paths, from_ref=from_ref, to_ref=to_ref, offset=offset, limit=limit
+            )
+        )
 
     def get_gitignore(self) -> str:
         return run_async(self._ns().get_gitignore())

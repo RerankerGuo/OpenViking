@@ -129,6 +129,14 @@ class ContextBuilder:
         # Core identity
         parts.append(await self._get_identity(session_key))
 
+        if session_key.type == "feishu":
+            parts.append(
+                "## Feishu images\n\n"
+                "To display an OpenViking image, use ![description](viking://...) outside code.\n"
+                "To cite an image URI without displaying it, use inline code.\n"
+                "Reading an image does not send it to the user."
+            )
+
         # Sandbox environment info
         if self.sandbox_manager:
             sandbox_cwd = await self.sandbox_manager.get_sandbox_cwd(session_key)
@@ -278,7 +286,7 @@ The following local and remote Skills extend your capabilities.
                 user_ids=memory_owner_user_ids if memory_owner_user_ids else None,
                 openviking_connection=self._openviking_connection,
             )
-            logger.info(f"viking_memory={viking_memory}")
+            logger.info(f"viking_memory={viking_memory[:200] if viking_memory else 'None'}")
             cost = round(_time.time() - start, 2)
             logger.info(
                 f"[READ_USER_MEMORY]: cost {cost}s, "
@@ -377,6 +385,7 @@ IMPORTANT:
         experience_recall_enable: bool | None = None,
         exp_exclude_uris: list[str] | None = None,
         experience_case_lookup: dict[str, Any] | None = None,
+        include_system: bool = True,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -394,6 +403,8 @@ IMPORTANT:
                 from exposing OpenViking tools. Defaults to ov_tools_enable.
             exp_exclude_uris: Optional list of experience URIs that have already been recalled
                 in this session and should be skipped (deduplication).
+            include_system: Whether to prepend the system prompt. Steer inputs reuse the active
+                turn's existing system prompt and set this to False.
 
         Returns:
             List of messages including system prompt.
@@ -401,14 +412,15 @@ IMPORTANT:
         messages = []
 
         # System prompt
-        system_prompt = await self.build_system_prompt(
-            session_key,
-            ov_tools_enable=ov_tools_enable,
-            profile_user_list=profile_user_list,
-            memory_peer_ids=memory_peer_ids,
-            memory_owner_user_ids=memory_owner_user_ids,
-        )
-        messages.append({"role": "system", "content": system_prompt})
+        if include_system:
+            system_prompt = await self.build_system_prompt(
+                session_key,
+                ov_tools_enable=ov_tools_enable,
+                profile_user_list=profile_user_list,
+                memory_peer_ids=memory_peer_ids,
+                memory_owner_user_ids=memory_owner_user_ids,
+            )
+            messages.append({"role": "system", "content": system_prompt})
 
         # History
         if not self._eval:

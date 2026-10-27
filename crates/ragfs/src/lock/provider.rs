@@ -1,7 +1,7 @@
 //! PathLockProvider trait and built-in implementations.
 //!
-//! The provider is a pure storage abstraction — it does not implement lock semantics
-//! (conflict detection, waiting, etc.). Those belong to `PathLockManager`.
+//! The provider owns token storage. Backends with transactional storage may also
+//! implement the optional atomic capabilities used by `PathLockManager`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,13 +14,113 @@ use crate::core::FileSystem;
 use crate::crypto;
 
 use super::codec::LockTokenCodec;
-use super::types::{LockToken, PathLockError, PathLockResult};
+use super::types::{LockToken, PathLockError, PathLockRequest, PathLockResult};
+
+/// Representation used for handles stored in a PathLock lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathLockHandleMode {
+    /// Handles are resolver-generated lock-file paths.
+    LockPath,
+    /// Handles are normalized logical paths.
+    LogicalPath,
+}
+
+/// Token mutation made during one lock acquisition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcquisitionChange {
+    /// A new token was created.
+    Created {
+        /// Token written by the provider.
+        replacement: LockToken,
+    },
+    /// The same owner already held an equal or stronger token.
+    Reentrant,
+    /// A same-owner Exact token became Tree.
+    Upgraded {
+        /// Token restored if local lease publication fails.
+        previous: LockToken,
+        /// Tree token written by the provider.
+        replacement: LockToken,
+    },
+}
+
+/// One mutation made by an atomic provider acquisition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicAcquisition {
+    /// Provider handle stored in the PathLock lease.
+    pub handle: String,
+    /// Token mutation used by rollback.
+    pub change: AcquisitionChange,
+}
+
+/// Committed atomic acquisition mutations and storage-side recovery statistics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicAcquisitionResult {
+    /// Mutations used to publish or roll back the local lease.
+    pub acquisitions: Vec<AtomicAcquisition>,
+    /// Stale tokens actually removed or replaced by this committed transaction.
+    pub stale_tokens_removed: usize,
+}
 
 /// Storage abstraction for lock tokens. Only `PathLockManager` should call these methods.
 #[async_trait]
 pub trait PathLockProvider: Send + Sync {
     /// Human-readable provider name for config/logging/metrics.
     fn name(&self) -> &'static str;
+
+    /// Return how this provider represents lease handles.
+    fn handle_mode(&self) -> PathLockHandleMode {
+        PathLockHandleMode::LockPath
+    }
+
+    /// Attempt one atomic batch acquisition when supported.
+    async fn try_acquire_batch_atomic(
+        &self,
+        _requests: &[PathLockRequest],
+        _owner_id: &str,
+        _now_ns: u128,
+        _stale_before_ns: u128,
+    ) -> PathLockResult<Option<Vec<AtomicAcquisition>>> {
+        Ok(None)
+    }
+
+    /// Acquire with recovery statistics. Existing providers keep their atomic hook
+    /// and report zero until they implement storage-side recovery accounting.
+    async fn try_acquire_batch_atomic_with_stats(
+        &self,
+        requests: &[PathLockRequest],
+        owner_id: &str,
+        now_ns: u128,
+        stale_before_ns: u128,
+    ) -> PathLockResult<Option<AtomicAcquisitionResult>> {
+        Ok(self
+            .try_acquire_batch_atomic(requests, owner_id, now_ns, stale_before_ns)
+            .await?
+            .map(|acquisitions| AtomicAcquisitionResult {
+                acquisitions,
+                stale_tokens_removed: 0,
+            }))
+    }
+
+    /// Roll back one completed atomic acquisition when supported.
+    async fn rollback_acquisitions_atomic(
+        &self,
+        _acquisitions: &[AtomicAcquisition],
+        _owner_id: &str,
+    ) -> PathLockResult<Option<()>> {
+        Ok(None)
+    }
+
+    /// Return whether one path is covered by a live token when supported.
+    async fn is_path_locked_atomic(
+        &self,
+        _path: &str,
+        _now_ns: u128,
+        _stale_before_ns: u128,
+        _ignore_stale: bool,
+    ) -> PathLockResult<Option<bool>> {
+        Ok(None)
+    }
 
     /// Read the token at `lock_path`, returning `None` if no token exists.
     async fn read_token(&self, lock_path: &str) -> PathLockResult<Option<LockToken>>;
@@ -45,6 +145,22 @@ pub trait PathLockProvider: Send + Sync {
         owner_id: &str,
         time_ns: u128,
     ) -> PathLockResult<bool>;
+
+    /// Refresh owned tokens, returning one result per input path in input order.
+    /// A failed path must not prevent the remaining paths from being refreshed.
+    /// Backends without batch support retain the single-token behavior.
+    async fn refresh_tokens(
+        &self,
+        lock_paths: &[String],
+        owner_id: &str,
+        time_ns: u128,
+    ) -> Vec<PathLockResult<bool>> {
+        let mut results = Vec::with_capacity(lock_paths.len());
+        for lock_path in lock_paths {
+            results.push(self.refresh_token(lock_path, owner_id, time_ns).await);
+        }
+        results
+    }
 
     /// Remove the token at `lock_path` if owned by `owner_id`.
     /// `force` bypasses storage CAS after the ownership check.
@@ -192,7 +308,16 @@ impl FilesystemPathLockProvider {
 
     /// Read raw token bytes from `lock_path`, returning `None` if no token exists.
     async fn read_token_raw(&self, lock_path: &str) -> PathLockResult<Option<Vec<u8>>> {
-        match self.fs.read(lock_path, 0, 0).await {
+        let mut result = self.fs.read(lock_path, 0, 0).await;
+        if result
+            .as_ref()
+            .is_ok_and(|data| LockTokenCodec::decode(String::from_utf8_lossy(data).trim()).is_err())
+        {
+            // A concurrent in-place CAS write can expose a transient partial token.
+            tokio::task::yield_now().await;
+            result = self.fs.read(lock_path, 0, 0).await;
+        }
+        match result {
             Ok(data) => Ok(Some(data)),
             Err(e) => {
                 if matches!(
@@ -229,6 +354,34 @@ mod tests {
     use crate::plugins::memfs::MemFileSystem;
 
     use super::*;
+
+    /// Verify the fallback reports each path and continues after a token error.
+    #[tokio::test]
+    async fn batch_refresh_fallback_preserves_per_path_results() {
+        let fs = Arc::new(MemFileSystem::new());
+        fs.mkdir("/data", 0o755).await.unwrap();
+        for (path, raw) in [
+            ("/data/bad", "not-a-token"),
+            ("/data/good", "owner:100:T"),
+            ("/data/foreign", "other:100:E"),
+        ] {
+            fs.write(path, raw.as_bytes(), 0, WriteFlag::Create)
+                .await
+                .unwrap();
+        }
+        let provider = FilesystemPathLockProvider::new(fs, 30.0);
+        let paths = ["bad", "good", "foreign", "missing"].map(|name| format!("/data/{name}"));
+        let results = provider.refresh_tokens(&paths, "owner", 200).await;
+        assert_eq!(results.len(), paths.len());
+        assert!(matches!(results[0], Err(PathLockError::InvalidToken(_))));
+        assert!(matches!(results[1], Ok(true)));
+        assert!(matches!(results[2], Ok(false)));
+        assert!(matches!(results[3], Ok(false)));
+        let token = provider.read_token(&paths[1]).await.unwrap().unwrap();
+        assert_eq!(token.time_ns, 200);
+        assert_eq!(token.lock_type, crate::lock::PathLockKind::Tree);
+        assert!(provider.refresh_tokens(&[], "owner", 200).await.is_empty());
+    }
 
     /// Verify legacy encrypted lock files are treated as removable upgrade leftovers.
     #[tokio::test]
