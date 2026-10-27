@@ -35,6 +35,17 @@ logger = get_logger(__name__)
 
 _UNSET = object()
 
+# Storage-format marker for watch-task timestamps. Builds carrying this change
+# persist naive UTC strings plus this key; its absence marks legacy storage
+# whose naive timestamps are host-local wall time. The key is unknown to older
+# builds, which ignore it (``Config.extra = "ignore"``) and keep parsing the
+# naive strings they always parsed, so neither an upgrade nor a downgrade
+# produces a mixed naive/aware comparison crash.
+STORAGE_TIMESTAMPS_TZ_KEY = "timestamps_tz"
+STORAGE_TIMESTAMPS_TZ_UTC = "utc"
+
+_WATCH_TIMESTAMP_FIELDS = ("created_at", "last_execution_time", "next_execution_time")
+
 
 def _rewrite_uri_prefix(uri: str, old_prefix: str, new_prefix: str) -> str:
     old_normalized = old_prefix.rstrip("/")
@@ -52,6 +63,23 @@ def _parent_uri(uri: str) -> Optional[str]:
     if parent in {"viking:/", "viking://"}:
         return None
     return parent
+
+
+def _serialize_storage_timestamp(value: Optional[datetime]) -> Optional[str]:
+    """Serialize a watch timestamp in the upgrade-compatible storage form.
+
+    Persisted timestamps stay naive ISO strings — byte-compatible with what
+    pre-upgrade builds wrote and still parse — so an older binary reading a
+    file written by this build never mixes a naive ``datetime.now()`` with an
+    aware value. The dropped UTC designation is restored on load through
+    ``STORAGE_TIMESTAMPS_TZ_KEY``, keeping the instant exact for readers that
+    understand the marker.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc)
+    return value.replace(tzinfo=None).isoformat()
 
 
 class WatchTask(BaseModel):
@@ -105,13 +133,14 @@ class WatchTask(BaseModel):
     def _normalize_timestamps(cls, value: Any) -> Any:
         """Normalize watch timestamps to aware UTC.
 
-        Watch state written by older builds holds naive local wall-clock
-        values, and restored or hand-edited storage can carry offset-aware
-        strings. Comparing either against an aware "now" raises
+        Watch state written by older builds holds naive wall-clock values,
+        and restored or hand-edited storage can carry offset-aware strings.
+        Comparing either against an aware "now" raises
         ``TypeError: can't compare offset-naive and offset-aware datetimes``
         and terminates the scheduler loop, so normalize on the way in: a naive
-        value is read as host-local time, which preserves the instant it was
-        written at.
+        value is read as host-local time, which preserves the instant a legacy
+        build wrote it at. :meth:`from_dict` re-tags naive values from
+        marker-carrying storage as UTC before they reach this validator.
         """
         if isinstance(value, str):
             value = parse_iso_datetime(value)
@@ -159,6 +188,12 @@ class WatchTask(BaseModel):
         """Convert task to dictionary for watch-task persistence."""
         data = self.to_dict()
         data["to_is_directory"] = self.to_is_directory
+        # Persist naive UTC strings plus the format marker: the strings stay
+        # parseable by pre-upgrade builds, and the marker keeps the UTC
+        # reading unambiguous for builds that understand it.
+        for key in _WATCH_TIMESTAMP_FIELDS:
+            data[key] = _serialize_storage_timestamp(getattr(self, key))
+        data[STORAGE_TIMESTAMPS_TZ_KEY] = STORAGE_TIMESTAMPS_TZ_UTC
         if self.auth_state is not None:
             data["auth_state"] = self.auth_state
         if self.connector_states is not None:
@@ -169,6 +204,18 @@ class WatchTask(BaseModel):
     def from_dict(cls, data: Dict[str, Any]) -> "WatchTask":
         """Create task from dictionary."""
         data = dict(data)
+        # Feature-detect the storage generation: marker-carrying files hold
+        # naive UTC strings, legacy files hold naive host-local strings.
+        # Tagging marker values as UTC here lets the naive reading in the
+        # field validator stay reserved for the legacy interpretation.
+        naive_is_utc = data.pop(STORAGE_TIMESTAMPS_TZ_KEY, None) == STORAGE_TIMESTAMPS_TZ_UTC
+        for key in _WATCH_TIMESTAMP_FIELDS:
+            value = data.get(key)
+            if isinstance(value, str):
+                parsed = parse_iso_datetime(value)
+                if parsed.tzinfo is None and naive_is_utc:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                data[key] = parsed
         if data.get("processor_kwargs") is None:
             data["processor_kwargs"] = {}
         if data.get("auth_state") is not None and not isinstance(data.get("auth_state"), dict):
@@ -325,7 +372,7 @@ class WatchManager:
 
             data = {
                 "tasks": [task.to_storage_dict() for task in self._tasks.values()],
-                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": _serialize_storage_timestamp(datetime.now(timezone.utc)),
             }
 
             content = json.dumps(data, ensure_ascii=False, indent=2)
